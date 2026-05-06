@@ -218,7 +218,7 @@ class MockDashboard:
                                       "secret rejected", 401)
             return None
 
-        @app.post("/api/v1/agents/register")
+        @app.post("/api/public/v1/agents/register")
         def register():
             token = request.headers.get("X-Registration-Token", "")
             body = request.get_json(silent=True) or {}
@@ -240,7 +240,7 @@ class MockDashboard:
                     "config": dict(state.config),
                 }), 201
 
-        @app.get("/api/v1/agents/<agent_id>/config")
+        @app.get("/api/public/v1/agents/<agent_id>/config")
         def get_config(agent_id):
             err = _check_auth(agent_id)
             if err is not None:
@@ -249,7 +249,7 @@ class MockDashboard:
                 state.received_get_config_calls += 1
                 return jsonify(dict(state.config)), 200
 
-        @app.post("/api/v1/agents/<agent_id>/heartbeat")
+        @app.post("/api/public/v1/agents/<agent_id>/heartbeat")
         def heartbeat(agent_id):
             err = _check_auth(agent_id)
             if err is not None:
@@ -274,7 +274,7 @@ class MockDashboard:
                     "pending_actions": actions,
                 }), 200
 
-        @app.post("/api/v1/agents/<agent_id>/reports")
+        @app.post("/api/public/v1/agents/<agent_id>/reports")
         def reports(agent_id):
             err = _check_auth(agent_id)
             if err is not None:
@@ -318,7 +318,7 @@ class MockDashboard:
                     "action_completed": body.get("action_id"),
                 }), 200
 
-        @app.post("/api/v1/agents/<agent_id>/discovered-hosts")
+        @app.post("/api/public/v1/agents/<agent_id>/discovered-hosts")
         def discovered_hosts(agent_id):
             err = _check_auth(agent_id)
             if err is not None:

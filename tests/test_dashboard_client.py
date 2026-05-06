@@ -13,6 +13,7 @@ import requests
 import responses
 
 from certwatch.dashboard_client import (
+    API_PATH_PREFIX,
     DashboardAuthError,
     DashboardClient,
     DashboardConflictError,
@@ -24,10 +25,11 @@ from certwatch.dashboard_client import (
     DashboardRetriableError,
     DashboardServerError,
     DashboardValidationError,
+    _read_api_path_prefix,
 )
 
 DASH = "https://certwatch.lovable.app"
-PATH = "/api/v1/whatever"
+PATH = "/api/public/v1/whatever"
 URL = DASH + PATH
 
 
@@ -396,3 +398,51 @@ def test_per_call_timeout_overrides_default(monkeypatch):
     monkeypatch.setattr(c._session, "request", capture)
     c._request("GET", PATH, timeout=2.0)
     assert seen["timeout"] == 2.0
+
+
+# ---- API_PATH_PREFIX configurability --------------------------------
+
+
+def test_api_path_prefix_default_matches_lovable_runtime():
+    """Default is /api/public/v1 because Lovable's runtime gates every
+    non-/api/public/* path behind dashboard JWT auth. Pinned by literal
+    value — same defensive pattern as BACKOFF_SCHEDULE."""
+    assert API_PATH_PREFIX == "/api/public/v1"
+
+
+def test_api_path_prefix_reads_from_env_var(monkeypatch):
+    """Operators on a non-Lovable platform override via env var, e.g.
+    `API_PATH_PREFIX=/api/v1`. Tested via the function directly so we
+    don't need module-reload gymnastics."""
+    monkeypatch.setenv("API_PATH_PREFIX", "/api/v1")
+    assert _read_api_path_prefix() == "/api/v1"
+
+
+def test_api_path_prefix_strips_trailing_slash(monkeypatch):
+    """Defensive normalization: operators may write the env var with or
+    without a trailing slash. Both produce the same URLs."""
+    monkeypatch.setenv("API_PATH_PREFIX", "/api/v1/")
+    assert _read_api_path_prefix() == "/api/v1"
+    monkeypatch.setenv("API_PATH_PREFIX", "/custom/prefix///")
+    assert _read_api_path_prefix() == "/custom/prefix"
+
+
+def test_api_path_prefix_used_in_constructed_url(monkeypatch, client):
+    """End-to-end: setting API_PATH_PREFIX changes the URL the client
+    actually hits. Monkeypatches the module-level constant, then confirms
+    a real `_request` call uses the new prefix."""
+    monkeypatch.setattr(
+        "certwatch.dashboard_client.API_PATH_PREFIX", "/custom/prefix"
+    )
+    custom_url = f"{DASH}/custom/prefix/agents/aid/config"
+    with responses.RequestsMock() as rsps:
+        rsps.add("GET", custom_url, json={"config_version": 0}, status=200)
+        # Use a fresh client so agent_id is set (the get_config endpoint
+        # requires it). Stand-alone _request to keep the test focused.
+        c = DashboardClient(DASH, agent_id="aid", agent_secret="agtkey_x")
+        # Construct the URL the same way get_config does, but inline
+        # so the test isn't coupled to that endpoint method's path.
+        from certwatch.dashboard_client import API_PATH_PREFIX as PREFIX
+        assert PREFIX == "/custom/prefix"
+        c._request("GET", f"{PREFIX}/agents/aid/config")
+        assert rsps.calls[0].request.url == custom_url

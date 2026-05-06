@@ -26,9 +26,15 @@ from tests.e2e.mock_netbox import MockNetBox
 
 # All e2e tests get marked automatically by being in this directory —
 # `pytest -m "not e2e"` skips them, `pytest -m e2e` runs only them.
+# IMPORTANT: filter by file path so we only mark items collected from
+# tests/e2e/ — pytest_collection_modifyitems is called with ALL items
+# in the test session, not just items the conftest "owns", so a naive
+# `for item in items: item.add_marker(...)` would mark every unit test
+# as e2e too, breaking `pytest -m "not e2e"`.
 def pytest_collection_modifyitems(config, items):
     for item in items:
-        item.add_marker(pytest.mark.e2e)
+        if "tests/e2e" in str(item.fspath).replace("\\", "/"):
+            item.add_marker(pytest.mark.e2e)
 
 
 # ---- mock servers ---------------------------------------------------

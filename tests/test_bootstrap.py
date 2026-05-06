@@ -32,7 +32,7 @@ from certwatch.bootstrap import (
 from certwatch.clock import FakeClock
 
 DASH = "https://certwatch.lovable.app"
-REGISTER_URL = f"{DASH}/api/v1/agents/register"
+REGISTER_URL = f"{DASH}/api/public/v1/agents/register"
 
 REG_SUCCESS = {
     "agent_id": "a8f3d12e-7b4c-4d8a-9e1f-2c5b6a7d8e9f",
@@ -68,7 +68,7 @@ CONFIG_SUCCESS = {
 
 
 def _config_url(agent_id: str) -> str:
-    return f"{DASH}/api/v1/agents/{agent_id}/config"
+    return f"{DASH}/api/public/v1/agents/{agent_id}/config"
 
 
 # ---- env validation ---------------------------------------------------

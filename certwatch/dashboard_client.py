@@ -21,9 +21,32 @@ Non-retriable failures bubble out as their concrete subclass.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Optional
 
 import requests
+
+
+def _read_api_path_prefix() -> str:
+    """Read the API_PATH_PREFIX env var, normalizing trailing slashes.
+
+    Default is `/api/public/v1` because Lovable's runtime gates every
+    non-`/api/public/*` path behind dashboard JWT auth — agents have no
+    JWT, so anything else returns 403 before the route's own bearer-token
+    check runs. Operators deploying against a dashboard on a different
+    platform (no Lovable runtime) override via env var: e.g.,
+    `API_PATH_PREFIX=/api/v1`.
+
+    Trailing slashes are stripped so operators don't have to be careful
+    about exact form. The leading slash is required and not enforced
+    here — wrong values just produce 404s, which is loud enough."""
+    return os.environ.get("API_PATH_PREFIX", "/api/public/v1").rstrip("/")
+
+
+# Read once at module load. Production processes inherit env from their
+# container; tests that need a different prefix monkeypatch this constant
+# directly via `monkeypatch.setattr("certwatch.dashboard_client.API_PATH_PREFIX", "/x")`.
+API_PATH_PREFIX = _read_api_path_prefix()
 
 
 # ---- exception hierarchy ----------------------------------------------
@@ -270,7 +293,7 @@ class DashboardClient:
         platform: Optional[str],
         started_at: str,
     ) -> dict:
-        """POST /api/v1/agents/register — first-run-only credential exchange.
+        """POST /api/public/v1/agents/register — first-run-only credential exchange.
 
         Sends the one-time `registration_token` via `X-Registration-Token`
         header (NOT `Authorization`, per the API contract). On 201, returns
@@ -292,7 +315,7 @@ class DashboardClient:
             body["platform"] = platform
         return self._request(
             "POST",
-            "/api/v1/agents/register",
+            f"{API_PATH_PREFIX}/agents/register",
             body=body,
             headers={"X-Registration-Token": registration_token},
             authenticated=False,
@@ -307,7 +330,7 @@ class DashboardClient:
         action_id: Optional[str],
         checks: list[dict],
     ) -> dict:
-        """POST /api/v1/agents/{agent_id}/reports — submit batched cert results.
+        """POST /api/public/v1/agents/{agent_id}/reports — submit batched cert results.
 
         Stateless wire-format method. The caller owns the report_id (and
         retries with the SAME report_id on transport failures, per the
@@ -348,7 +371,7 @@ class DashboardClient:
         }
         return self._request(
             "POST",
-            f"/api/v1/agents/{self.agent_id}/reports",
+            f"{API_PATH_PREFIX}/agents/{self.agent_id}/reports",
             body=body,
         )
 
@@ -360,7 +383,7 @@ class DashboardClient:
         netbox_filter: str,
         hosts: list[dict],
     ) -> dict:
-        """POST /api/v1/agents/{agent_id}/discovered-hosts — REPLACE-semantics
+        """POST /api/public/v1/agents/{agent_id}/discovered-hosts — REPLACE-semantics
         sync of NetBox-discovered hosts.
 
         The dashboard derives removals server-side: any host with
@@ -396,7 +419,7 @@ class DashboardClient:
         }
         return self._request(
             "POST",
-            f"/api/v1/agents/{self.agent_id}/discovered-hosts",
+            f"{API_PATH_PREFIX}/agents/{self.agent_id}/discovered-hosts",
             body=body,
         )
 
@@ -408,7 +431,7 @@ class DashboardClient:
         current_config_version: int,
         stats: Optional[dict] = None,
     ) -> dict:
-        """POST /api/v1/agents/{agent_id}/heartbeat — 15s liveness signal.
+        """POST /api/public/v1/agents/{agent_id}/heartbeat — 15s liveness signal.
 
         Body shape:
           - sent_at, agent_version, uptime_seconds, current_config_version:
@@ -446,12 +469,12 @@ class DashboardClient:
             body["stats"] = stats
         return self._request(
             "POST",
-            f"/api/v1/agents/{self.agent_id}/heartbeat",
+            f"{API_PATH_PREFIX}/agents/{self.agent_id}/heartbeat",
             body=body,
         )
 
     def get_config(self) -> dict:
-        """GET /api/v1/agents/{agent_id}/config — fetch current operating config.
+        """GET /api/public/v1/agents/{agent_id}/config — fetch current operating config.
 
         Returns the full nested response (intervals, timeouts, concurrency,
         alert_thresholds_days, manual_hosts, plus any future fields). Does
@@ -464,7 +487,7 @@ class DashboardClient:
         """
         self._require_credentials()
         return self._request(
-            "GET", f"/api/v1/agents/{self.agent_id}/config"
+            "GET", f"{API_PATH_PREFIX}/agents/{self.agent_id}/config"
         )
 
     # ---- internal helpers ------------------------------------------

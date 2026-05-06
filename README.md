@@ -38,6 +38,7 @@ are automatic via `--restart unless-stopped`.
 | `LOG_LEVEL` | optional | `DEBUG` / `INFO` / `WARNING` / `ERROR`. Default `INFO`. `DEBUG` includes full SAN arrays in cert-check log lines. |
 | `AGENT_HOSTNAME` | optional | Overrides `socket.gethostname()` for register and heartbeat. Useful when container hostnames are random container IDs. |
 | `INTERNAL_CA_PATTERNS` | optional | Comma-separated case-insensitive substrings that match an internal CA's DN. Replaces the default list (`kurmi`, `internal`, `lab ca`, `corporate ca`, `intermediate ca`). Empty string disables internal-CA detection. |
+| `API_PATH_PREFIX` | optional | API path prefix used when calling the dashboard. Default: `/api/public/v1` (matches Lovable's runtime convention — non-`/api/public/*` paths get gated behind dashboard JWT auth that the agent doesn't have). Set to `/api/v1` if deploying against a dashboard on a different platform. Trailing slashes are stripped. |
 
 ## /data directory layout
 

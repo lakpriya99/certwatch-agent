@@ -42,10 +42,10 @@ DASH = "https://certwatch.lovable.app"
 AGENT_ID = "a8f3d12e-7b4c-4d8a-9e1f-2c5b6a7d8e9f"
 SECRET = "agtkey_test"
 
-REGISTER_URL = f"{DASH}/api/v1/agents/register"
-CONFIG_URL = f"{DASH}/api/v1/agents/{AGENT_ID}/config"
-HEARTBEAT_URL = f"{DASH}/api/v1/agents/{AGENT_ID}/heartbeat"
-REPORTS_URL = f"{DASH}/api/v1/agents/{AGENT_ID}/reports"
+REGISTER_URL = f"{DASH}/api/public/v1/agents/register"
+CONFIG_URL = f"{DASH}/api/public/v1/agents/{AGENT_ID}/config"
+HEARTBEAT_URL = f"{DASH}/api/public/v1/agents/{AGENT_ID}/heartbeat"
+REPORTS_URL = f"{DASH}/api/public/v1/agents/{AGENT_ID}/reports"
 
 
 CONFIG_BODY = {
@@ -646,7 +646,7 @@ def test_runner_with_full_netbox_config_starts_netbox_thread(tmp_path, monkeypat
             rsps.add("POST", REPORTS_URL, json=REPORT_OK_RESPONSE, status=200)
             rsps.add(
                 "POST",
-                f"{DASH}/api/v1/agents/{AGENT_ID}/discovered-hosts",
+                f"{DASH}/api/public/v1/agents/{AGENT_ID}/discovered-hosts",
                 json={
                     "received_at": "t", "summary": {
                         "total_received": 0, "created": 0, "updated": 0,

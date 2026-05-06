@@ -26,7 +26,7 @@ from certwatch.netbox_client import DiscoveredHost, NetBoxClient
 DASH = "https://certwatch.lovable.app"
 AGENT_ID = "a8f3d12e-7b4c-4d8a-9e1f-2c5b6a7d8e9f"
 SECRET = "agtkey_test"
-DISCOVERED_URL = f"{DASH}/api/v1/agents/{AGENT_ID}/discovered-hosts"
+DISCOVERED_URL = f"{DASH}/api/public/v1/agents/{AGENT_ID}/discovered-hosts"
 
 OK_RESPONSE = {
     "received_at": "2026-05-02T14:40:01Z",
