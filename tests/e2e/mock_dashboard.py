@@ -233,11 +233,24 @@ class MockDashboard:
                     return _envelope("invalid_registration_token",
                                       "token unknown", 401)
                 state.consumed_registration_tokens.add(token)
+                # Per Phase 4b spec, the register response's "config"
+                # is a small FLAT bootstrap snapshot (matches the
+                # dashboard's DB column names). Distinct from the
+                # GET /config endpoint, which returns the NESTED
+                # intervals/timeouts/concurrency shape. Real Lovable
+                # implements this distinction; the mock has to too,
+                # otherwise the e2e suite hides shape-handling bugs.
+                intervals = state.config.get("intervals", {})
+                flat_config_snapshot = {
+                    "heartbeat_interval_seconds": intervals.get("heartbeat_seconds", 15),
+                    "check_interval_seconds": intervals.get("check_seconds", 3600),
+                    "config_version": state.config.get("config_version", 1),
+                }
                 return jsonify({
                     "agent_id": state.agent_id,
                     "agent_secret": state.agent_secret,
                     "registered_at": state.registered_at,
-                    "config": dict(state.config),
+                    "config": flat_config_snapshot,
                 }), 201
 
         @app.get("/api/public/v1/agents/<agent_id>/config")

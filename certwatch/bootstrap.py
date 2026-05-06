@@ -338,7 +338,6 @@ def _bootstrap_first_run(
     agent_id = register_resp["agent_id"]
     agent_secret = register_resp["agent_secret"]
     registered_at = register_resp["registered_at"]
-    initial_config = register_resp.get("config", DEFAULT_CONFIG)
 
     save_credentials(
         creds_path,
@@ -357,7 +356,17 @@ def _bootstrap_first_run(
         }
     )
 
+    # Fetch the full nested config via GET /config rather than using
+    # the register response's "config" snapshot. The register response
+    # ships a small FLAT shape (heartbeat_interval_seconds etc., per
+    # the Phase 4b spec); the runtime code expects the NESTED shape
+    # (intervals.heartbeat_seconds, timeouts.*, concurrency.*) that
+    # GET /config returns. Calling get_config here makes first-run
+    # and subsequent-run produce the same in-memory config object —
+    # one shape across the whole agent. The extra HTTP call is
+    # one-per-process-lifetime, negligible cost.
     client = DashboardClient(dashboard_url, agent_id=agent_id, agent_secret=agent_secret)
+    initial_config = _fetch_initial_config_with_retry(client, clock)
     return BootstrapResult(
         client=client,
         agent_id=agent_id,

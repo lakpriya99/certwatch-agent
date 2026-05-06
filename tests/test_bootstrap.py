@@ -38,14 +38,15 @@ REG_SUCCESS = {
     "agent_id": "a8f3d12e-7b4c-4d8a-9e1f-2c5b6a7d8e9f",
     "agent_secret": "agtkey_long_random_xyz",
     "registered_at": "2026-05-02T14:30:01Z",
+    # Per Phase 4b spec, the register response's "config" is a small
+    # FLAT bootstrap snapshot (matches DB column names). The runtime
+    # code uses the NESTED shape from GET /config — bootstrap fetches
+    # that separately after register so both first-run and subsequent-
+    # run produce the same in-memory config object.
     "config": {
+        "heartbeat_interval_seconds": 15,
+        "check_interval_seconds": 3600,
         "config_version": 1,
-        "fetched_at": "2026-05-02T14:30:01Z",
-        "intervals": {"heartbeat_seconds": 15, "check_seconds": 3600, "netbox_sync_seconds": 3600},
-        "timeouts": {"tcp_connect_seconds": 5, "tls_handshake_seconds": 5},
-        "concurrency": {"max_parallel_checks": 20},
-        "alert_thresholds_days": [30, 7, 1],
-        "manual_hosts": [],
     },
 }
 
@@ -135,16 +136,56 @@ def test_bootstrap_first_run_registers_and_saves(tmp_path):
     assert fc.sleeps == []
 
 
-def test_bootstrap_first_run_uses_register_response_config(tmp_path):
-    """Initial config comes from the register response on first run; we
-    do NOT make an extra get_config call after register."""
+def test_bootstrap_first_run_fetches_full_config_via_get_config(tmp_path):
+    """Regression test for the FLAT-vs-NESTED config shape bug.
+
+    The register endpoint returns a small FLAT config snapshot per the
+    Phase 4b spec (heartbeat_interval_seconds, check_interval_seconds,
+    config_version). The agent's runtime code expects the NESTED shape
+    from GET /config (intervals.heartbeat_seconds, timeouts.*,
+    concurrency.*). An earlier bootstrap version used the register
+    response's "config" block directly, which produced KeyError:
+    'intervals' in the worker threads on first run.
+
+    The fix: after register, bootstrap calls GET /config to get the
+    full nested shape. Both first-run and subsequent-run produce the
+    same in-memory config object — one shape across the whole agent.
+    """
     env = {"DASHBOARD_URL": DASH, "REGISTRATION_TOKEN": "regtok_xyz"}
     with responses.RequestsMock() as rsps:
         rsps.add("POST", REGISTER_URL, json=REG_SUCCESS, status=201)
-        # NO get_config mocked — the test would fail with a connection
-        # error if bootstrap incorrectly tried to call it.
+        rsps.add("GET", _config_url(REG_SUCCESS["agent_id"]),
+                 json=CONFIG_SUCCESS, status=200)
         result = bootstrap(env=env, data_dir=tmp_path, clock=FakeClock())
-    assert result.initial_config == REG_SUCCESS["config"]
+
+    # initial_config is the GET /config response (nested shape), NOT
+    # the flat register-response snapshot.
+    assert result.initial_config == CONFIG_SUCCESS
+    # Specifically: the runtime keys are present.
+    assert "intervals" in result.initial_config
+    assert result.initial_config["intervals"]["heartbeat_seconds"] == 15
+    assert "timeouts" in result.initial_config
+    assert "concurrency" in result.initial_config
+    # And the flat-shape keys are NOT what we expose.
+    assert "heartbeat_interval_seconds" not in result.initial_config
+
+
+def test_bootstrap_first_run_falls_back_to_default_config_on_get_config_failure(tmp_path):
+    """If the post-register GET /config call fails (5xx, network), fall
+    back to DEFAULT_CONFIG so the agent still starts. The next heartbeat
+    will signal config_refresh_required and re-fetch when the dashboard
+    recovers."""
+    env = {"DASHBOARD_URL": DASH, "REGISTRATION_TOKEN": "regtok_xyz"}
+    with responses.RequestsMock() as rsps:
+        rsps.add("POST", REGISTER_URL, json=REG_SUCCESS, status=201)
+        rsps.add("GET", _config_url(REG_SUCCESS["agent_id"]),
+                 json={}, status=503)
+        result = bootstrap(env=env, data_dir=tmp_path, clock=FakeClock())
+
+    assert result.initial_config == DEFAULT_CONFIG
+    # config_version=0 so the first successful heartbeat will signal
+    # config_refresh_required and pull the real config.
+    assert result.initial_config["config_version"] == 0
 
 
 def test_bootstrap_first_run_register_request_carries_expected_fields(tmp_path):
