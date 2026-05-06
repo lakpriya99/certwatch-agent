@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local agent state — NEVER commit
+.env
+.env.*
+data/
+agent.json
+pending_reports/
+
+# Claude Code's local agent data (this directory)
+.claude/
+
+# Logs
+*.log
+
+# Local temp / scratch
+/tmp/
+*.tmp

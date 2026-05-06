@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "certwatch"
+version = "0.1.0"
+description = "TLS certificate monitoring agent for Kurmi labs"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=42.0",
+    "requests>=2.31",
+    "pyyaml>=6.0",
+    "pynetbox>=7.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "responses>=0.25",
+    "flask>=3.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["certwatch*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "network: tests that require live internet access (badssl.com, google.com)",
+    "e2e: end-to-end tests with real agent subprocess + mock servers (slow, ~2 min)",
+]
+addopts = "-q"

@@ -1,0 +1,65 @@
+# Keep the build context tight: smaller context = faster builds and
+# zero risk of accidentally shipping local secrets/state into images.
+
+# VCS
+.git/
+.gitignore
+.gitattributes
+
+# Python build/runtime artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+.Python
+build/
+dist/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tests — never in the runtime image
+tests/
+
+# CI / GitHub — read by GitHub Actions, not by image build
+.github/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Secrets and local state — NEVER ship these
+.env
+.env.*
+data/
+pending_reports/
+
+# Dev-only files
+requirements-dev.txt
+example-config.yaml
+
+# Logs
+*.log
+
+# Documentation — README is fine to have in context, but the runtime
+# image doesn't strictly need it. LICENSE is included implicitly
+# because no exclusion rule matches it.
+*.md
+!README.md

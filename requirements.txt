@@ -1,0 +1,12 @@
+# Production runtime dependencies. Mirrors `[project] dependencies` in
+# pyproject.toml — the duplication is intentional: pyproject is the
+# source of truth for `pip install -e ".[dev]"` developer flow, and
+# this file lets the Dockerfile install deps in a separately-cached
+# layer (deps don't reinstall when only source changes).
+#
+# When adding a runtime dep, update BOTH files. CI will catch drift
+# because Docker builds run after tests pass.
+cryptography>=42.0
+requests>=2.31
+pyyaml>=6.0
+pynetbox>=7.3

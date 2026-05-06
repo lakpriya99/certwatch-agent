@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8.0
+responses>=0.25
+flask>=3.0

@@ -1,0 +1,19 @@
+# Example local-mode config — run with:
+#   python -m certwatch local --config example-config.yaml
+hosts:
+  - hostname: google.com
+    display_name: Google
+    tags: [public]
+  - hostname: expired.badssl.com
+    display_name: Expired (badssl)
+    tags: [badssl, expected-fail]
+  - hostname: self-signed.badssl.com
+    tags: [badssl]
+  - hostname: 192.0.2.1   # TEST-NET-1, will time out
+    tags: [unreachable]
+
+sweep_interval_seconds: 60
+max_concurrency: 4
+log_level: INFO
+tcp_connect_seconds: 3
+tls_handshake_seconds: 5
