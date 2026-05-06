@@ -20,6 +20,7 @@ from certwatch.netbox_client import (
     NetBoxClient,
     NetBoxSyncError,
     _parse_filter_expr,
+    _parse_netbox_verify_ssl_env,
     _resolve_hostname,
     _resolve_port,
     _resolve_tags,
@@ -360,3 +361,120 @@ def test_resolve_port_handles_non_dict_custom_fields():
 def test_resolve_tags_handles_missing_attribute():
     d = SimpleNamespace()  # no tags attr at all
     assert _resolve_tags(d) == []
+
+
+# ---- NETBOX_VERIFY_SSL parsing -------------------------------------
+
+
+def test_parse_verify_ssl_env_default_true_when_unset(monkeypatch):
+    monkeypatch.delenv("NETBOX_VERIFY_SSL", raising=False)
+    assert _parse_netbox_verify_ssl_env() is True
+
+
+def test_parse_verify_ssl_env_empty_string_uses_default():
+    """Forgiving: empty string treated as unset, defaults to True."""
+    assert _parse_netbox_verify_ssl_env({"NETBOX_VERIFY_SSL": ""}) is True
+    assert _parse_netbox_verify_ssl_env({"NETBOX_VERIFY_SSL": "   "}) is True
+
+
+@pytest.mark.parametrize("v", ["true", "True", "TRUE", "1", "yes", "YES", "Yes"])
+def test_parse_verify_ssl_env_truthy_values(v):
+    assert _parse_netbox_verify_ssl_env({"NETBOX_VERIFY_SSL": v}) is True
+
+
+@pytest.mark.parametrize("v", ["false", "False", "FALSE", "0", "no", "NO", "No"])
+def test_parse_verify_ssl_env_falsy_values_case_insensitive(v):
+    assert _parse_netbox_verify_ssl_env({"NETBOX_VERIFY_SSL": v}) is False
+
+
+def test_parse_verify_ssl_env_invalid_value_falls_back_to_true(caplog):
+    """Silent bypass would be worse than explicit opt-in. Invalid →
+    secure default + warning log so the operator can see they typoed."""
+    with caplog.at_level("WARNING"):
+        result = _parse_netbox_verify_ssl_env({"NETBOX_VERIFY_SSL": "maybe"})
+    assert result is True
+    msgs = [r.msg for r in caplog.records
+            if isinstance(r.msg, dict) and r.msg.get("event") == "netbox_invalid_verify_ssl_value_using_default"]
+    assert len(msgs) == 1
+    assert msgs[0]["raw_value"] == "maybe"
+    assert msgs[0]["default_used"] is True
+
+
+# ---- NetBoxClient verify_ssl wiring --------------------------------
+
+
+def test_netbox_client_verify_ssl_default_true(monkeypatch):
+    """When env var is unset and no explicit kwarg, the client's
+    underlying session has verify=True (secure by default)."""
+    monkeypatch.delenv("NETBOX_VERIFY_SSL", raising=False)
+    _patch_api(monkeypatch, [])
+    client = NetBoxClient(url="https://nb", token="t", filter_expr="")
+    assert client._api.http_session.verify is True
+
+
+def test_netbox_client_verify_ssl_false_when_env_says_false(monkeypatch):
+    monkeypatch.setenv("NETBOX_VERIFY_SSL", "false")
+    _patch_api(monkeypatch, [])
+    client = NetBoxClient(url="https://nb", token="t", filter_expr="")
+    assert client._api.http_session.verify is False
+
+
+def test_netbox_client_verify_ssl_invalid_value_falls_back_to_true(monkeypatch, caplog):
+    monkeypatch.setenv("NETBOX_VERIFY_SSL", "definitely-maybe")
+    _patch_api(monkeypatch, [])
+    with caplog.at_level("WARNING"):
+        client = NetBoxClient(url="https://nb", token="t", filter_expr="")
+    assert client._api.http_session.verify is True
+    # The parse warning fires — confirms the env-var path was exercised.
+    msgs = [r.msg for r in caplog.records
+            if isinstance(r.msg, dict) and r.msg.get("event") == "netbox_invalid_verify_ssl_value_using_default"]
+    assert len(msgs) == 1
+
+
+@pytest.mark.parametrize("v", ["FALSE", "False", "false", "0", "NO", "no"])
+def test_netbox_client_verify_ssl_case_insensitive_falsy(monkeypatch, v):
+    monkeypatch.setenv("NETBOX_VERIFY_SSL", v)
+    _patch_api(monkeypatch, [])
+    client = NetBoxClient(url="https://nb", token="t", filter_expr="")
+    assert client._api.http_session.verify is False
+
+
+def test_netbox_client_logs_warning_when_ssl_disabled(monkeypatch, caplog):
+    """The warning is the operator's audit trail. WARNING level so it
+    surfaces in default INFO+ log filtering, not buried."""
+    monkeypatch.setenv("NETBOX_VERIFY_SSL", "false")
+    _patch_api(monkeypatch, [])
+    with caplog.at_level("WARNING"):
+        NetBoxClient(url="https://netbox.lab.example", token="t", filter_expr="")
+    msgs = [r.msg for r in caplog.records
+            if isinstance(r.msg, dict) and r.msg.get("event") == "netbox_ssl_verification_disabled"]
+    assert len(msgs) == 1
+    # URL surfaced for audit visibility — operator can confirm WHICH
+    # NetBox instance is using insecure TLS.
+    assert msgs[0]["url"] == "https://netbox.lab.example"
+
+
+def test_netbox_client_no_warning_when_ssl_enabled(monkeypatch, caplog):
+    """The warning should NOT fire on the secure default path. A noisy
+    warning in production logs is exactly the kind of friction that
+    leads operators to suppress all warnings, masking real problems."""
+    monkeypatch.delenv("NETBOX_VERIFY_SSL", raising=False)
+    _patch_api(monkeypatch, [])
+    with caplog.at_level("WARNING"):
+        NetBoxClient(url="https://nb", token="t", filter_expr="")
+    msgs = [r.msg for r in caplog.records
+            if isinstance(r.msg, dict) and r.msg.get("event") == "netbox_ssl_verification_disabled"]
+    assert msgs == []
+
+
+def test_netbox_client_explicit_verify_ssl_overrides_env(monkeypatch):
+    """If verify_ssl is passed explicitly, env var is ignored. The runner
+    relies on this to read NETBOX_VERIFY_SSL from its own env Mapping
+    rather than os.environ — tests with synthetic envs depend on this
+    contract."""
+    monkeypatch.setenv("NETBOX_VERIFY_SSL", "true")
+    _patch_api(monkeypatch, [])
+    client = NetBoxClient(
+        url="https://nb", token="t", filter_expr="", verify_ssl=False,
+    )
+    assert client._api.http_session.verify is False

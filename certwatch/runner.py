@@ -47,7 +47,7 @@ from certwatch.check_thread import CertCheckThread
 from certwatch.clock import Clock, RealClock
 from certwatch.dashboard_client import DashboardAuthError
 from certwatch.heartbeat_thread import ConfigState, HeartbeatThread, StatsState
-from certwatch.netbox_client import NetBoxClient
+from certwatch.netbox_client import NetBoxClient, _parse_netbox_verify_ssl_env
 from certwatch.netbox_sync import NetBoxSyncThread
 from certwatch.report_submission import replay_pending_reports
 
@@ -361,14 +361,22 @@ class AgentRunner:
             return None
         token = self.env["NETBOX_TOKEN"].strip()
         filter_expr = self.env["NETBOX_FILTER"].strip()
+        # Read NETBOX_VERIFY_SSL from the runner's env Mapping (not
+        # os.environ) so tests with synthetic envs see the right value.
+        # NetBoxClient logs the security warning on its own when False.
+        verify_ssl = _parse_netbox_verify_ssl_env(self.env)
         log.info(
             {
                 "event": "netbox_configured",
                 "url": url,
                 "filter": filter_expr,
+                "verify_ssl": verify_ssl,
             }
         )
-        return NetBoxClient(url=url, token=token, filter_expr=filter_expr)
+        return NetBoxClient(
+            url=url, token=token, filter_expr=filter_expr,
+            verify_ssl=verify_ssl,
+        )
 
     # ---- test hooks --------------------------------------------------
 

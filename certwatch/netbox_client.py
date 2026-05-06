@@ -26,14 +26,50 @@ state when NetBox is unreachable".
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Mapping, Optional, Union
 from urllib.parse import parse_qs
 
 import pynetbox
+import urllib3
 from pynetbox.core.query import ContentError, RequestError
 
 log = logging.getLogger("certwatch")
+
+
+# Accepted truthy/falsy spellings for NETBOX_VERIFY_SSL — same forgiving
+# convention as the rest of the agent's env-var handling. Pinned by tests.
+_VERIFY_SSL_TRUE = frozenset(("true", "1", "yes"))
+_VERIFY_SSL_FALSE = frozenset(("false", "0", "no"))
+
+
+def _parse_netbox_verify_ssl_env(env: Optional[Mapping[str, str]] = None) -> bool:
+    """Read NETBOX_VERIFY_SSL with forgiving parsing.
+
+    Default is True (safe). Operators on lab/homelab NetBox instances
+    with self-signed certs explicitly set NETBOX_VERIFY_SSL=false to
+    bypass verification. Invalid values fall back to True with a
+    warning — silent bypass would be worse than explicit opt-in."""
+    if env is None:
+        env = os.environ
+    raw = env.get("NETBOX_VERIFY_SSL", "")
+    normalized = raw.strip().lower()
+    if not normalized:
+        return True
+    if normalized in _VERIFY_SSL_TRUE:
+        return True
+    if normalized in _VERIFY_SSL_FALSE:
+        return False
+    log.warning(
+        {
+            "event": "netbox_invalid_verify_ssl_value_using_default",
+            "raw_value": raw,
+            "default_used": True,
+            "accepted_values": sorted(_VERIFY_SSL_TRUE | _VERIFY_SSL_FALSE),
+        }
+    )
+    return True
 
 
 @dataclass(frozen=True)
@@ -64,11 +100,19 @@ class NetBoxClient:
         filter_expr: str,
         *,
         timeout: float = 30.0,
+        verify_ssl: Optional[bool] = None,
     ) -> None:
+        # `verify_ssl=None` means "read NETBOX_VERIFY_SSL env var" — the
+        # natural default. Production passes through the runner which has
+        # already parsed the env Mapping; standalone tests / direct
+        # construction also work via the env-var fallback path.
+        if verify_ssl is None:
+            verify_ssl = _parse_netbox_verify_ssl_env()
         self.url = url
         self.token = token
         self.filter_expr = filter_expr
         self.timeout = timeout
+        self.verify_ssl = verify_ssl
         self._api = pynetbox.api(url, token=token)
         # pynetbox 7.x accepts a custom http_session for connection pooling
         # and timeout; we set the timeout directly on the underlying
@@ -79,6 +123,31 @@ class NetBoxClient:
             # Older pynetbox or non-standard session — non-fatal; pynetbox
             # will use its own defaults.
             pass
+        # Wire SSL-verify into the requests session. requests.Session.verify
+        # propagates to all subsequent requests pynetbox makes via this
+        # session, so this single assignment covers every endpoint.
+        try:
+            self._api.http_session.verify = verify_ssl  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        if not verify_ssl:
+            # Without this, urllib3 emits one InsecureRequestWarning per
+            # request — instant log spam in any environment hitting a
+            # self-signed cert. Disable just the InsecureRequestWarning
+            # category so other urllib3 warnings (DNS, version mismatches)
+            # still surface.
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            log.warning(
+                {
+                    "event": "netbox_ssl_verification_disabled",
+                    "url": url,
+                    "note": (
+                        "TLS verification disabled for NetBox API. "
+                        "Only safe for lab environments with self-signed "
+                        "certificates. NEVER use in production."
+                    ),
+                }
+            )
 
     def fetch_hosts(self) -> list[DiscoveredHost]:
         """Query NetBox using the configured filter; return ordered

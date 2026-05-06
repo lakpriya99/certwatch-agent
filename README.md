@@ -35,6 +35,7 @@ are automatic via `--restart unless-stopped`.
 | `NETBOX_URL` | optional | If set, enables NetBox sync. Half-configured NetBox state (URL set, token or filter missing) fails fast at startup. |
 | `NETBOX_TOKEN` | with NETBOX_URL | NetBox API token. |
 | `NETBOX_FILTER` | with NETBOX_URL | pynetbox filter expression, e.g. `tag=monitor-cert`. |
+| `NETBOX_VERIFY_SSL` | optional | `true` or `false` (case-insensitive; `1`/`0` and `yes`/`no` also accepted). Default: `true`. Set to `false` only for lab NetBox instances using self-signed certs. **Bypassing verification is insecure for production.** When disabled, the agent emits one `netbox_ssl_verification_disabled` WARNING log at startup as an audit trail. |
 | `LOG_LEVEL` | optional | `DEBUG` / `INFO` / `WARNING` / `ERROR`. Default `INFO`. `DEBUG` includes full SAN arrays in cert-check log lines. |
 | `AGENT_HOSTNAME` | optional | Overrides `socket.gethostname()` for register and heartbeat. Useful when container hostnames are random container IDs. |
 | `INTERNAL_CA_PATTERNS` | optional | Comma-separated case-insensitive substrings that match an internal CA's DN. Replaces the default list (`kurmi`, `internal`, `lab ca`, `corporate ca`, `intermediate ca`). Empty string disables internal-CA detection. |
