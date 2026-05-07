@@ -70,6 +70,39 @@ report is atomically written here before any network attempt; the file
 is removed once the dashboard has it (200) or has-already-had it (409).
 On agent restart, leftover files are submitted before any new cycle runs.
 
+## Cert check status taxonomy
+
+The agent classifies each cert check result into one of these statuses,
+applied in priority order (a cert that's both expired AND from an
+internal CA reports `cert_expired` — the more critical condition wins):
+
+**Cert evaluation** (a cert was retrieved and parsed):
+
+| Status | Meaning |
+|---|---|
+| `success` | Cert valid, hostname matches, chain trusted by system, not expiring soon. |
+| `cert_expiring_soon` | Cert valid but `days_until_expiry` is within the alert threshold (≤30 days by default). |
+| `tls_warning` | Cert valid and hostname matches, but the chain isn't trusted by the system trust store (typical for internal/self-signed CAs). `chain_trust_reason` carries the specific reason. |
+| `cert_expired` | Past `notAfter`. |
+| `cert_no_usable_hostname` | Cert exists and parses, but has no SAN and no CN. Operator action: investigate at the source. |
+
+**Connection-family** (couldn't even retrieve a cert; mutually exclusive with the above):
+
+| Status | Meaning |
+|---|---|
+| `connection_refused` | TCP refused (port closed) or unresolvable. |
+| `connection_timeout` | TCP didn't respond in time. |
+| `tls_failed_no_cert` | TLS started but the server presented no cert. |
+| `tls_failed_malformed_cert` | Server presented a cert that won't parse (bad DER, weird encoding). |
+
+**Status precedence** (when multiple apply):
+`cert_expired > cert_expiring_soon > tls_warning > success`
+
+**Note on `is_self_signed`**: this is metadata, not a status. A self-signed
+cert and a cert signed by an internal CA both produce status `tls_warning`
+with `chain_trusted_by_system: false`; the `is_self_signed` boolean
+distinguishes them for UI rendering.
+
 ## Logs
 
 Structured JSON, one event per line, on stdout:
