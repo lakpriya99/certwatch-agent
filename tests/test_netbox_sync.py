@@ -767,3 +767,127 @@ def test_run_netbox_sync_updates_state_even_when_dashboard_submission_fails(
     snap = state.snapshot()
     assert len(snap) == 2
     assert {h.netbox_device_id for h in snap} == {1, 2}
+
+
+# ============================================================
+#  first-sync-done event (Bug 2 startup-cycle race fix)
+# ============================================================
+
+
+def test_netbox_sync_thread_sets_first_sync_done_event_after_success(
+    dashboard_client, stats,
+):
+    """The cycle thread waits on this event before its first cycle.
+    NetBoxSyncThread must set it after the first successful sync so
+    NetBox hosts appear in the startup report."""
+    fc = FakeClock()
+    nb = _fake_netbox_client(_hosts((1, "10.0.0.1", 443)))
+    shutdown = threading.Event()
+    config = ConfigState(initial=dict(INITIAL_CONFIG))
+    first_sync_done = threading.Event()
+
+    sync_count = {"n": 0}
+
+    def handler(request):
+        sync_count["n"] += 1
+        # Stop after the first sync — the test only needs to confirm
+        # the event fires at the right point.
+        shutdown.set()
+        return (200, {}, json.dumps(OK_RESPONSE))
+
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
+        rsps.add_callback("POST", DISCOVERED_URL, callback=handler)
+        thread = NetBoxSyncThread(
+            netbox_client=nb, dashboard_client=dashboard_client,
+            config_state=config, stats_state=stats,
+            shutdown_event=shutdown, clock=fc,
+            first_sync_done_event=first_sync_done,
+        )
+        try:
+            thread.start()
+            thread.join(timeout=2.0)
+        finally:
+            _stop_thread(thread, shutdown)
+
+    assert sync_count["n"] == 1
+    assert first_sync_done.is_set(), (
+        "first_sync_done must fire after the first successful sync"
+    )
+
+
+def test_netbox_sync_thread_sets_first_sync_done_event_after_netbox_failure(
+    dashboard_client, stats,
+):
+    """If NetBox is unreachable, the first sync attempt returns
+    NetBoxSyncResult(status='netbox_error') without raising. The event
+    must STILL fire — otherwise the cycle thread blocks indefinitely
+    on a misconfigured NetBox, and manual hosts go unchecked."""
+    from certwatch.netbox_client import NetBoxSyncError
+
+    fc = FakeClock()
+    nb = MagicMock(spec=NetBoxClient)
+    nb.url = "https://netbox.example"
+    nb.filter_expr = "tag=monitor"
+    nb.fetch_hosts.side_effect = NetBoxSyncError("ECONNREFUSED")
+
+    shutdown = threading.Event()
+    config = ConfigState(initial=dict(INITIAL_CONFIG))
+    first_sync_done = threading.Event()
+
+    # No /discovered-hosts mock — if it were called, that'd be a bug
+    # (NetBox failure must not trigger a submit).
+    with responses.RequestsMock():
+        thread = NetBoxSyncThread(
+            netbox_client=nb, dashboard_client=dashboard_client,
+            config_state=config, stats_state=stats,
+            shutdown_event=shutdown, clock=fc,
+            first_sync_done_event=first_sync_done,
+        )
+        try:
+            thread.start()
+            # Allow the loop to spin once and set the event.
+            assert first_sync_done.wait(timeout=2.0)
+        finally:
+            shutdown.set()
+            thread.join(timeout=2.0)
+
+
+def test_netbox_sync_thread_does_not_re_fire_event_after_first_sync(
+    dashboard_client, stats,
+):
+    """The event semantics is "first sync done" — not "any sync done".
+    Subsequent syncs must not re-fire it. The cycle thread doesn't
+    consult the event after its initial wait, so re-firing wouldn't
+    cause a bug, but the contract is one-shot and the test pins it."""
+    fc = FakeClock()
+    nb = _fake_netbox_client(_hosts((1, "1.1.1.1", 443)))
+    shutdown = threading.Event()
+    config = ConfigState(initial=dict(INITIAL_CONFIG))
+    first_sync_done = MagicMock(wraps=threading.Event())
+
+    sync_count = {"n": 0}
+
+    def handler(request):
+        sync_count["n"] += 1
+        if sync_count["n"] >= 2:
+            shutdown.set()
+        return (200, {}, json.dumps(OK_RESPONSE))
+
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
+        rsps.add_callback("POST", DISCOVERED_URL, callback=handler)
+        rsps.add_callback("POST", DISCOVERED_URL, callback=handler)
+        thread = NetBoxSyncThread(
+            netbox_client=nb, dashboard_client=dashboard_client,
+            config_state=config, stats_state=stats,
+            shutdown_event=shutdown, clock=fc,
+            first_sync_done_event=first_sync_done,
+        )
+        try:
+            thread.start()
+            thread.join(timeout=3.0)
+        finally:
+            _stop_thread(thread, shutdown)
+
+    # set() called exactly once (after the FIRST sync). The mock's
+    # wraps= forwards the call to the real Event but counts invocations.
+    assert first_sync_done.set.call_count == 1

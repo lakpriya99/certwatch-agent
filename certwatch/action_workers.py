@@ -414,6 +414,7 @@ def make_sync_netbox_handler(
     stats_state,  # StatsState
     clock: Clock,
     shutdown_event: threading.Event,
+    netbox_hosts_state=None,  # Optional[NetBoxHostsState]
 ) -> ActionHandler:
     """Phase 6: real sync_netbox handler.
 
@@ -422,6 +423,15 @@ def make_sync_netbox_handler(
     marks the action complete. When NetBox is NOT configured, logs and
     skips — the action expires unfulfilled, which is the truthful outcome
     for an agent that can't fulfill it.
+
+    `netbox_hosts_state` MUST be the same instance that the cycle thread
+    and check_host action handler read. Passing it here makes the
+    operator-triggered sync_netbox action behave identically to the
+    scheduled NetBoxSyncThread: both update the agent-local view so a
+    follow-up Check Now on a freshly-synced device resolves correctly.
+    Pre-fix this argument was missing — dashboard-triggered syncs only
+    populated dashboard inventory, leaving the agent's local
+    netbox_hosts_state stale until the next scheduled sync.
 
     Auth errors from the dashboard during submission propagate up via
     DashboardAuthError; the action worker pool's dispatcher catches and
@@ -449,6 +459,7 @@ def make_sync_netbox_handler(
             stats_state=stats_state,
             clock=clock,
             shutdown_event=shutdown_event,
+            netbox_hosts_state=netbox_hosts_state,
         )
 
     return handle

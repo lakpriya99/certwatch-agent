@@ -183,6 +183,17 @@ class AgentRunner:
         # 3a. Construct NetBoxClient if configured (Phase 6).
         netbox_client = self._build_netbox_client_if_configured()
 
+        # First-NetBox-sync gate: the cycle thread waits on this event
+        # before its startup cycle so NetBox-discovered hosts appear in
+        # the first report rather than being skipped due to
+        # check_thread vs netbox_thread race. NetBoxSyncThread sets it
+        # after its first sync attempt (success or failure). When NetBox
+        # is not configured we pre-set it so the cycle thread proceeds
+        # without delay.
+        first_netbox_sync_done_event = threading.Event()
+        if netbox_client is None:
+            first_netbox_sync_done_event.set()
+
         # 4. Build handlers + threads + pool.
         check_host_handler = make_check_host_handler(
             client=bootstrap_result.client,
@@ -198,6 +209,7 @@ class AgentRunner:
             stats_state=stats_state,
             clock=self.clock,
             shutdown_event=self._shutdown_event,
+            netbox_hosts_state=netbox_hosts_state,
         )
 
         heartbeat_thread = HeartbeatThread(
@@ -231,6 +243,7 @@ class AgentRunner:
             auth_error_event=self._auth_error_event,
             clock=self.clock,
             netbox_hosts_state=netbox_hosts_state,
+            first_netbox_sync_done_event=first_netbox_sync_done_event,
         )
 
         netbox_thread: Optional[NetBoxSyncThread] = None
@@ -244,6 +257,7 @@ class AgentRunner:
                 auth_error_event=self._auth_error_event,
                 clock=self.clock,
                 netbox_hosts_state=netbox_hosts_state,
+                first_sync_done_event=first_netbox_sync_done_event,
             )
 
         # 5. Install signal handlers. Main-thread only; in tests we run

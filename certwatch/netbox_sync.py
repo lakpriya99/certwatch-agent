@@ -322,6 +322,7 @@ class NetBoxSyncThread(threading.Thread):
         clock: Clock,
         netbox_hosts_state: Optional[NetBoxHostsState] = None,
         auth_error_event: Optional[threading.Event] = None,
+        first_sync_done_event: Optional[threading.Event] = None,
         name: str = "certwatch-netbox-sync",
     ) -> None:
         super().__init__(name=name, daemon=False)
@@ -332,10 +333,17 @@ class NetBoxSyncThread(threading.Thread):
         self._netbox_hosts_state = netbox_hosts_state
         self._shutdown_event = shutdown_event
         self._auth_error_event = auth_error_event
+        # Set after the first sync attempt completes (success OR failure).
+        # The cycle thread waits on this before its first cycle so NetBox
+        # hosts are present in the startup report. Setting on failure
+        # (not just success) avoids deadlocking the cycle on a broken
+        # NetBox — the cycle proceeds without netbox hosts in that case.
+        self._first_sync_done_event = first_sync_done_event
         self._clock = clock
 
     def run(self) -> None:
         log.info({"event": "netbox_sync_thread_starting"})
+        first_sync_completed = False
         try:
             while not self._shutdown_event.is_set():
                 try:
@@ -373,6 +381,13 @@ class NetBoxSyncThread(threading.Thread):
                         }
                     )
 
+                # Unblock the cycle thread after the FIRST attempt
+                # (success or any failure). Subsequent attempts don't
+                # re-fire the event — the cycle has long since proceeded.
+                if not first_sync_completed and self._first_sync_done_event is not None:
+                    self._first_sync_done_event.set()
+                    first_sync_completed = True
+
                 interval = self._sync_interval()
                 if self._clock.wait_for(interval, self._shutdown_event):
                     break
@@ -386,6 +401,13 @@ class NetBoxSyncThread(threading.Thread):
             )
             self._shutdown_event.set()
         finally:
+            # Defensive: if the thread exits before completing one full
+            # iteration of the loop (auth error on first attempt,
+            # uncaught exception, etc.), the cycle thread would block
+            # indefinitely waiting for first_sync_done. Setting the
+            # event here breaks the deadlock on the way out.
+            if not first_sync_completed and self._first_sync_done_event is not None:
+                self._first_sync_done_event.set()
             log.info({"event": "netbox_sync_thread_exiting"})
 
     def _sync_interval(self) -> float:

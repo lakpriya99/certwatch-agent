@@ -71,6 +71,13 @@ class CertCheckThread(threading.Thread):
     updates StatsState.
     """
 
+    # Maximum time the cycle thread will wait for the first NetBox sync
+    # to complete before running its first cycle. Bounds the worst-case
+    # startup gap when NetBox is misconfigured/unreachable: after this
+    # wait, the cycle proceeds without netbox hosts (manual hosts still
+    # get checked).
+    _FIRST_NETBOX_SYNC_WAIT_SECONDS = 30.0
+
     def __init__(
         self,
         *,
@@ -85,6 +92,7 @@ class CertCheckThread(threading.Thread):
         submit_fn: Callable = default_submit,
         netbox_hosts_state: Optional[NetBoxHostsState] = None,
         auth_error_event: Optional[threading.Event] = None,
+        first_netbox_sync_done_event: Optional[threading.Event] = None,
         name: str = "certwatch-check-thread",
     ) -> None:
         super().__init__(name=name, daemon=False)
@@ -97,6 +105,11 @@ class CertCheckThread(threading.Thread):
         # Optional companion event for the runner to distinguish auth-driven
         # shutdown (exit 2) from signal-driven shutdown (exit 0).
         self._auth_error_event = auth_error_event
+        # Set by NetBoxSyncThread after its first sync attempt (success
+        # or failure). When None or already set, the thread skips the
+        # gate and runs its first cycle immediately. Runner pre-sets it
+        # when NetBox isn't configured.
+        self._first_netbox_sync_done_event = first_netbox_sync_done_event
         self._clock = clock
         self._check_fn = check_fn
         self._discovery_check_fn = discovery_check_fn
@@ -104,6 +117,14 @@ class CertCheckThread(threading.Thread):
 
     def run(self) -> None:
         log.info({"event": "check_thread_starting"})
+
+        # Gate the first cycle on NetBox sync. Without this, the startup
+        # cycle reports netbox_hosts_count=0 because NetBoxSyncThread
+        # hasn't populated state yet — operators see "Last check: never"
+        # on every NetBox host until the next scheduled cycle (potentially
+        # an hour later).
+        self._wait_for_first_netbox_sync()
+
         is_first_cycle = True
 
         try:
@@ -203,6 +224,38 @@ class CertCheckThread(threading.Thread):
     def _check_interval(self) -> float:
         config = self._config_state.snapshot()
         return float(config["intervals"]["check_seconds"])
+
+    def _wait_for_first_netbox_sync(self) -> None:
+        """Block until the first NetBox sync completes (or the bounded
+        wait elapses, or shutdown is signaled). No-op when the event
+        wasn't wired in (NetBox not configured) or has already fired.
+
+        Runner pre-sets the event for NetBox-disabled deployments so
+        manual-only setups don't pay the startup cost."""
+        ev = self._first_netbox_sync_done_event
+        if ev is None or ev.is_set():
+            return
+
+        log.info({"event": "check_thread_waiting_for_first_netbox_sync"})
+        # Bound the wait so a misconfigured/down NetBox doesn't block
+        # cert checks indefinitely. Manual hosts will still be checked
+        # if we time out.
+        ev.wait(timeout=self._FIRST_NETBOX_SYNC_WAIT_SECONDS)
+        if ev.is_set():
+            log.info({"event": "check_thread_first_netbox_sync_done_proceeding"})
+        else:
+            log.warning(
+                {
+                    "event": "check_thread_first_netbox_sync_timeout_proceeding",
+                    "wait_seconds": self._FIRST_NETBOX_SYNC_WAIT_SECONDS,
+                    "note": (
+                        "first NetBox sync did not complete within the "
+                        "startup window; first cycle runs without NetBox "
+                        "hosts. Subsequent cycles pick them up once sync "
+                        "succeeds."
+                    ),
+                }
+            )
 
 
 def _run_one_cycle(

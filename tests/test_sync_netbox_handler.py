@@ -142,3 +142,98 @@ def test_handler_with_netbox_client_doesnt_submit_on_netbox_error(
     # No responses mock — if submit is attempted, the test sees ConnectionError.
     with responses.RequestsMock():
         handler(_action_ctx())  # must not raise
+
+
+def test_handler_updates_local_netbox_hosts_state_on_successful_fetch(
+    dashboard_client, stats
+):
+    """Bug-fix regression test: dashboard-triggered sync_netbox must
+    update the agent's local NetBoxHostsState so a subsequent on-demand
+    Check Now action can resolve a freshly-synced netbox_device_id.
+
+    Pre-fix the handler factory didn't accept netbox_hosts_state and
+    didn't pass it to run_netbox_sync, so only NetBoxSyncThread updated
+    local state. An operator who tagged a new device, pressed
+    "Sync NetBox", then immediately pressed "Check Now" would get
+    action_check_host_netbox_id_not_found because local state still
+    lacked the new device."""
+    from certwatch.netbox_sync import NetBoxHostsState
+
+    nb = MagicMock(spec=NetBoxClient)
+    nb.url = "https://netbox.example"
+    nb.filter_expr = "tag=monitor-cert"
+    new_host = DiscoveredHost(
+        netbox_device_id=227, hostname="kurmi.lab", port=443,
+        display_name="KURMI", tags=["vmware"], ip_address="10.0.5.227",
+    )
+    nb.fetch_hosts.return_value = [new_host]
+
+    netbox_state = NetBoxHostsState()  # starts empty
+    assert netbox_state.snapshot() == []
+
+    handler = make_sync_netbox_handler(
+        netbox_client=nb, dashboard_client=dashboard_client,
+        stats_state=stats, clock=FakeClock(),
+        shutdown_event=threading.Event(),
+        netbox_hosts_state=netbox_state,
+    )
+
+    with responses.RequestsMock() as rsps:
+        rsps.add_callback("POST", DISCOVERED_URL,
+                           callback=lambda r: (200, {}, json.dumps(OK_RESPONSE)))
+        handler(_action_ctx())
+
+    # Local state now reflects the freshly-fetched device.
+    snapshot = netbox_state.snapshot()
+    assert len(snapshot) == 1
+    assert snapshot[0].netbox_device_id == 227
+    assert snapshot[0].hostname == "kurmi.lab"
+
+
+def test_handler_updates_local_state_even_when_dashboard_says_unchanged(
+    dashboard_client, stats
+):
+    """The dashboard's sync response (created/updated/unchanged counts)
+    is telemetry only. Local state MUST always reflect the agent's
+    fetch result, regardless of what the dashboard already had —
+    otherwise a re-sync after a new device was added doesn't update the
+    agent's view, because the dashboard reports 'unchanged' for the
+    pre-existing devices and 'created' counts don't tell the agent
+    anything about its own state."""
+    from certwatch.netbox_sync import NetBoxHostsState
+
+    nb = MagicMock(spec=NetBoxClient)
+    nb.url = "https://netbox.example"
+    nb.filter_expr = "tag=monitor-cert"
+    nb.fetch_hosts.return_value = [
+        DiscoveredHost(netbox_device_id=1, hostname="a", port=443,
+                        display_name="A", tags=["x"]),
+        DiscoveredHost(netbox_device_id=2, hostname="b", port=443,
+                        display_name="B", tags=["x"]),
+        DiscoveredHost(netbox_device_id=3, hostname="c", port=443,
+                        display_name="C", tags=["x"]),
+    ]
+
+    netbox_state = NetBoxHostsState()
+
+    handler = make_sync_netbox_handler(
+        netbox_client=nb, dashboard_client=dashboard_client,
+        stats_state=stats, clock=FakeClock(),
+        shutdown_event=threading.Event(),
+        netbox_hosts_state=netbox_state,
+    )
+
+    # Dashboard claims it already had everything ("unchanged: 3").
+    unchanged_response = {
+        **OK_RESPONSE,
+        "summary": {"total_received": 3, "created": 0, "updated": 0,
+                     "removed": 0, "unchanged": 3},
+    }
+    with responses.RequestsMock() as rsps:
+        rsps.add_callback("POST", DISCOVERED_URL,
+                           callback=lambda r: (200, {}, json.dumps(unchanged_response)))
+        handler(_action_ctx())
+
+    # Despite the "unchanged" response, local state IS populated from
+    # the fetch.
+    assert sorted(h.netbox_device_id for h in netbox_state.snapshot()) == [1, 2, 3]

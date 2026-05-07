@@ -1105,3 +1105,186 @@ def test_cycle_preserves_manual_first_then_netbox_order(client):
         {"type": "netbox", "netbox_device_id": 100},
         {"type": "netbox", "netbox_device_id": 200},
     ]
+
+
+# ============================================================
+#  first-NetBox-sync gate (regression for startup-cycle race)
+# ============================================================
+
+
+def test_check_thread_waits_for_first_netbox_sync_event_before_first_cycle(client):
+    """Bug-fix regression test: the check thread must NOT run its
+    startup cycle before NetBoxSyncThread has populated state — that
+    race produced reports with netbox_hosts_count=0 even when NetBox
+    had hosts to share. The thread now blocks on first_netbox_sync_done
+    until the netbox thread sets it, then runs the first cycle."""
+    from certwatch.netbox_sync import NetBoxHostsState
+
+    fc = FakeClock()
+    netbox_state = NetBoxHostsState()
+    netbox_state.replace([_netbox_host(1247, "esxi02.lab")])
+
+    first_sync_done = threading.Event()  # NOT pre-set
+    cycle_started = threading.Event()
+    submit_done = threading.Event()
+
+    def fake_check(host, port, **k):
+        cycle_started.set()
+        return _success_result(host, port)
+
+    def fake_discovery(target, port, **k):
+        cycle_started.set()
+        return _success_discovery_result(target, port)
+
+    def fake_submit(**k):
+        submit_done.set()
+        k["shutdown_event"].set()
+        return _delivered()
+
+    thread = CertCheckThread(
+        client=client, data_dir="/tmp",
+        config_state=ConfigState(initial=dict(INITIAL_CONFIG)),
+        stats_state=StatsState(clock=fc),
+        shutdown_event=threading.Event(), clock=fc,
+        check_fn=fake_check, discovery_check_fn=fake_discovery,
+        submit_fn=fake_submit,
+        netbox_hosts_state=netbox_state,
+        first_netbox_sync_done_event=first_sync_done,
+    )
+
+    thread.start()
+    try:
+        # Brief window: the cycle should NOT have started yet because
+        # first_sync_done isn't set.
+        time.sleep(0.2)
+        assert not cycle_started.is_set(), (
+            "cycle ran before the first-NetBox-sync gate was released"
+        )
+
+        # Now release the gate — cycle should run promptly.
+        first_sync_done.set()
+        assert submit_done.wait(timeout=2.0), (
+            "cycle did not run within 2s of first_sync_done being set"
+        )
+    finally:
+        thread._shutdown_event.set()
+        thread.join(timeout=2.0)
+
+
+def test_check_thread_proceeds_after_timeout_when_first_sync_never_completes(
+    client, monkeypatch, caplog,
+):
+    """If NetBox is misconfigured/unreachable and the first sync never
+    completes, the check thread must still run cycles after a bounded
+    wait — otherwise manual hosts would never be checked."""
+    from certwatch.netbox_sync import NetBoxHostsState
+
+    # Shrink the wait so the test runs quickly.
+    monkeypatch.setattr(
+        CertCheckThread, "_FIRST_NETBOX_SYNC_WAIT_SECONDS", 0.3
+    )
+
+    fc = FakeClock()
+    config = {**INITIAL_CONFIG, "manual_hosts": [
+        {"host_id": "h1", "hostname": "manual.example", "port": 443,
+         "added_at": "t"},
+    ]}
+    netbox_state = NetBoxHostsState()  # empty — no hosts ever land
+
+    first_sync_done = threading.Event()  # never set
+    submit_done = threading.Event()
+
+    def fake_submit(**k):
+        submit_done.set()
+        k["shutdown_event"].set()
+        return _delivered()
+
+    thread = CertCheckThread(
+        client=client, data_dir="/tmp",
+        config_state=ConfigState(initial=config),
+        stats_state=StatsState(clock=fc),
+        shutdown_event=threading.Event(), clock=fc,
+        check_fn=lambda *a, **k: _success_result("manual.example"),
+        submit_fn=fake_submit,
+        netbox_hosts_state=netbox_state,
+        first_netbox_sync_done_event=first_sync_done,
+    )
+    with caplog.at_level("INFO"):
+        thread.start()
+        try:
+            assert submit_done.wait(timeout=3.0), (
+                "cycle did not proceed after the first-sync wait elapsed"
+            )
+        finally:
+            thread._shutdown_event.set()
+            thread.join(timeout=2.0)
+
+    timeout_logs = [
+        r.msg for r in caplog.records
+        if isinstance(r.msg, dict)
+        and r.msg.get("event") == "check_thread_first_netbox_sync_timeout_proceeding"
+    ]
+    assert len(timeout_logs) == 1
+    assert timeout_logs[0]["wait_seconds"] == 0.3
+
+
+def test_check_thread_does_not_wait_when_event_already_set(client):
+    """When NetBox isn't configured, runner pre-sets the event so
+    manual-only deployments don't pay any startup wait. The thread's
+    gate must be a no-op in this case."""
+    fc = FakeClock()
+    pre_set_event = threading.Event()
+    pre_set_event.set()
+
+    submit_done = threading.Event()
+
+    def fake_submit(**k):
+        submit_done.set()
+        k["shutdown_event"].set()
+        return _delivered()
+
+    thread = CertCheckThread(
+        client=client, data_dir="/tmp",
+        config_state=ConfigState(initial=dict(INITIAL_CONFIG)),
+        stats_state=StatsState(clock=fc),
+        shutdown_event=threading.Event(), clock=fc,
+        check_fn=lambda h, p, **k: _success_result(h, p),
+        submit_fn=fake_submit,
+        first_netbox_sync_done_event=pre_set_event,
+    )
+    thread.start()
+    try:
+        # Cycle should run promptly without any wait.
+        assert submit_done.wait(timeout=2.0)
+    finally:
+        thread._shutdown_event.set()
+        thread.join(timeout=2.0)
+
+
+def test_check_thread_with_no_event_param_runs_immediately(client):
+    """Backward-compat: callers that don't pass first_netbox_sync_done_event
+    (existing test fixtures) skip the gate entirely. None means 'no
+    gate wired'; not the same as 'event waiting'."""
+    fc = FakeClock()
+    submit_done = threading.Event()
+
+    def fake_submit(**k):
+        submit_done.set()
+        k["shutdown_event"].set()
+        return _delivered()
+
+    thread = CertCheckThread(
+        client=client, data_dir="/tmp",
+        config_state=ConfigState(initial=dict(INITIAL_CONFIG)),
+        stats_state=StatsState(clock=fc),
+        shutdown_event=threading.Event(), clock=fc,
+        check_fn=lambda h, p, **k: _success_result(h, p),
+        submit_fn=fake_submit,
+        # Note: no first_netbox_sync_done_event — defaults to None
+    )
+    thread.start()
+    try:
+        assert submit_done.wait(timeout=2.0)
+    finally:
+        thread._shutdown_event.set()
+        thread.join(timeout=2.0)

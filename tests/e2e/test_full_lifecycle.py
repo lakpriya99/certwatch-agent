@@ -771,3 +771,175 @@ def test_scenario_13_netbox_host_without_primary_ip_falls_back_to_hostname(
 
     rc = agent.stop(timeout=10.0)
     assert rc == 0
+
+
+# ============================================================
+#  Scenario 14: startup cycle waits for first NetBox sync (Bug 2)
+# ============================================================
+
+
+def test_scenario_14_startup_cycle_includes_netbox_hosts_no_race(
+    mock_dashboard, mock_netbox, agent_factory, fresh_data_dir,
+):
+    """Regression test for the production startup race: the FIRST cycle
+    must include NetBox-discovered hosts when NetBox is configured and
+    has hosts. Pre-fix, check_thread and netbox_sync_thread started
+    together; the cycle read empty netbox_hosts_state and the first
+    report had netbox_hosts_count=0. Operators saw 'Last check: never'
+    on every NetBox device until the next scheduled cycle (default 1h).
+
+    Fix: check_thread blocks on the first_netbox_sync_done event before
+    its first cycle. Bounded wait protects against misconfigured/down
+    NetBox."""
+    mock_dashboard.add_valid_registration_token(REGISTRATION_TOKEN)
+    mock_netbox.add_device(
+        netbox_device_id=2701, name="localhost",
+        primary_ip4="127.0.0.1/32",
+        custom_fields={"cert_check_port": 9},
+        tags=["monitor-cert"],
+    )
+    mock_netbox.add_device(
+        netbox_device_id=2702, name="localhost",
+        primary_ip4="127.0.0.1/32",
+        custom_fields={"cert_check_port": 9},
+        tags=["monitor-cert"],
+    )
+
+    env = _base_env(mock_dashboard, extra={
+        "NETBOX_URL": mock_netbox.url,
+        "NETBOX_TOKEN": "nbtok_test",
+        "NETBOX_FILTER": "tag=monitor-cert",
+    })
+
+    agent = agent_factory(env=env, data_dir=fresh_data_dir)
+    agent.wait_for_event("agent_running", timeout=10.0)
+
+    # Wait specifically for the FIRST check_cycle_summary log.
+    def first_cycle_summary():
+        for ev in agent.events():
+            if ev.get("event") == "check_cycle_summary":
+                return ev
+        return None
+
+    _wait_until(lambda: first_cycle_summary() is not None, timeout=15.0)
+    summary = first_cycle_summary()
+    assert summary["netbox_hosts_count"] == 2, (
+        f"first cycle must include both NetBox hosts; got summary={summary}. "
+        "If netbox_hosts_count=0, the startup race regressed."
+    )
+
+    # The waiting log line should also be present — proves the gate
+    # actually engaged rather than the cycle running by luck.
+    waited = [
+        ev for ev in agent.events()
+        if ev.get("event") == "check_thread_waiting_for_first_netbox_sync"
+    ]
+    proceeded = [
+        ev for ev in agent.events()
+        if ev.get("event") == "check_thread_first_netbox_sync_done_proceeding"
+    ]
+    assert len(waited) == 1
+    assert len(proceeded) == 1
+
+    rc = agent.stop(timeout=10.0)
+    assert rc == 0
+
+
+# ============================================================
+#  Scenario 15: dashboard-triggered sync updates local state (Bug 1)
+# ============================================================
+
+
+def test_scenario_15_sync_netbox_action_updates_local_state(
+    mock_dashboard, mock_netbox, agent_factory, fresh_data_dir,
+):
+    """Regression test for the bug where dashboard-triggered Sync NetBox
+    populated dashboard inventory but left the agent's local
+    NetBoxHostsState empty. Repro: operator tags a new device, presses
+    Sync NetBox, then immediately presses Check Now — the Check Now
+    action fails with action_check_host_netbox_id_not_found because
+    the handler resolves netbox_device_ids against local state, which
+    the action handler hadn't updated.
+
+    Fix: make_sync_netbox_handler now accepts netbox_hosts_state and
+    threads it through to run_netbox_sync, mirroring the scheduled
+    NetBoxSyncThread."""
+    mock_dashboard.add_valid_registration_token(REGISTRATION_TOKEN)
+    # Start with NO devices in NetBox so the initial sync establishes
+    # an empty baseline.
+
+    env = _base_env(mock_dashboard, extra={
+        "NETBOX_URL": mock_netbox.url,
+        "NETBOX_TOKEN": "nbtok_test",
+        "NETBOX_FILTER": "tag=monitor-cert",
+    })
+    agent = agent_factory(env=env, data_dir=fresh_data_dir)
+    agent.wait_for_event("agent_running", timeout=10.0)
+
+    # Wait for the initial NetBox sync (zero hosts) to complete.
+    _wait_until(
+        lambda: len(mock_dashboard.received_discovered_hosts()) >= 1,
+        timeout=10.0,
+    )
+
+    # Operator tags a new device in NetBox.
+    mock_netbox.add_device(
+        netbox_device_id=2750, name="localhost",
+        primary_ip4="127.0.0.1/32",
+        custom_fields={"cert_check_port": 9},
+        tags=["monitor-cert"],
+    )
+
+    # Operator presses "Sync NetBox" in the dashboard. This dispatches
+    # a sync_netbox action. The new device should be syncrhonized to
+    # the dashboard AND to the agent's local state — that's the bug.
+    sync_action_id = mock_dashboard.queue_action("sync_netbox")
+    _wait_until(
+        lambda: any(
+            r.get("action_id") == sync_action_id
+            for r in mock_dashboard.received_discovered_hosts()
+        ),
+        timeout=10.0,
+    )
+
+    # NOW the operator immediately presses "Check Now" on the new
+    # device. Pre-fix: the action handler resolves netbox_device_id
+    # against local state, doesn't find 2750, logs
+    # action_check_host_netbox_id_not_found and skips.
+    check_action_id = mock_dashboard.queue_action(
+        "check_host",
+        payload={"host_ref": {"type": "netbox", "netbox_device_id": 2750}},
+    )
+    _wait_until(
+        lambda: any(
+            r.get("action_id") == check_action_id
+            for r in mock_dashboard.received_reports()
+        ),
+        timeout=15.0,
+    )
+
+    # The Check Now action must NOT have logged "id not found".
+    not_found = [
+        ev for ev in agent.events()
+        if ev.get("event") == "action_check_host_netbox_id_not_found"
+        and ev.get("netbox_device_id") == 2750
+    ]
+    assert not_found == [], (
+        "action_check_host_netbox_id_not_found fired for the freshly-"
+        "synced device — local state wasn't updated by the sync_netbox "
+        "action handler. Bug 1 regressed."
+    )
+
+    # And the on_demand report must include a netbox check for 2750.
+    on_demand = next(
+        r for r in mock_dashboard.received_reports()
+        if r.get("action_id") == check_action_id
+    )
+    assert on_demand["report_type"] == "on_demand"
+    assert len(on_demand["checks"]) == 1
+    check = on_demand["checks"][0]
+    assert check["host_ref"]["type"] == "netbox"
+    assert check["host_ref"]["netbox_device_id"] == 2750
+
+    rc = agent.stop(timeout=10.0)
+    assert rc == 0
