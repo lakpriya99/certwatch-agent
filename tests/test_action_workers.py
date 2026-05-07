@@ -546,8 +546,68 @@ def test_check_host_skips_when_host_id_not_in_config(client, caplog):
     assert log_data["manual_hosts_count"] == 2
 
 
-def test_check_host_netbox_ref_logs_not_yet_supported(client, caplog):
-    """Phase 6 will replace this branch; for now, log and skip."""
+def test_check_host_netbox_ref_resolves_via_netbox_hosts_state(client):
+    """The netbox host_ref now goes through the same cert-check pipeline
+    as manual hosts. The handler resolves netbox_device_id to (hostname,
+    port) via NetBoxHostsState, then calls check_fn + submit_fn just
+    like the manual path."""
+    from certwatch.netbox_client import DiscoveredHost
+    from certwatch.netbox_sync import NetBoxHostsState
+
+    captured = {}
+
+    def fake_check(host, port, **k):
+        captured["host"] = host
+        captured["port"] = port
+        return _success_cert_result(host, port)
+
+    def fake_submit(*, checks, action_id, **k):
+        captured["checks"] = checks
+        captured["action_id"] = action_id
+
+    netbox_state = NetBoxHostsState()
+    netbox_state.replace([
+        DiscoveredHost(
+            netbox_device_id=1247,
+            hostname="esxi02.collabtips.net",
+            port=443,
+            display_name="esxi02",
+            tags=["vmware"],
+        ),
+    ])
+
+    handler = make_check_host_handler(
+        client=client, data_dir="/tmp",
+        config_state=ConfigState(initial=dict(INITIAL_CONFIG)),
+        clock=FakeClock(), shutdown_event=threading.Event(),
+        check_fn=fake_check, submit_fn=fake_submit,
+        netbox_hosts_state=netbox_state,
+    )
+    ctx = ActionContext(
+        action_id="act-uuid-1", action_type="check_host",
+        payload={"host_ref": {"type": "netbox", "netbox_device_id": 1247}},
+        queued_at="t0", expires_at="2099-01-01T00:00:00Z",
+    )
+    handler(ctx)
+
+    # cert_check called with NetBox-derived hostname/port
+    assert captured["host"] == "esxi02.collabtips.net"
+    assert captured["port"] == 443
+    # Report submitted with the netbox host_ref echoed and action_id set
+    assert captured["action_id"] == "act-uuid-1"
+    assert len(captured["checks"]) == 1
+    assert captured["checks"][0]["host_ref"] == {
+        "type": "netbox", "netbox_device_id": 1247,
+    }
+
+
+def test_check_host_netbox_ref_skips_when_id_not_found(client, caplog):
+    """If the netbox_device_id isn't in our state snapshot (sync hasn't
+    happened or the host was removed from NetBox), log+skip with rich
+    diagnostic context. Don't synthesize a fake report — that would
+    pollute the host's history with a phantom failure."""
+    from certwatch.netbox_sync import NetBoxHostsState
+
     check_called = {"n": 0}
     submit_called = {"n": 0}
 
@@ -557,26 +617,61 @@ def test_check_host_netbox_ref_logs_not_yet_supported(client, caplog):
     def fake_submit(**k):
         submit_called["n"] += 1
 
+    netbox_state = NetBoxHostsState()  # empty — no sync has happened
+
     handler = make_check_host_handler(
         client=client, data_dir="/tmp",
         config_state=ConfigState(initial=dict(INITIAL_CONFIG)),
         clock=FakeClock(), shutdown_event=threading.Event(),
         check_fn=fake_check, submit_fn=fake_submit,
+        netbox_hosts_state=netbox_state,
+    )
+    ctx = ActionContext(
+        action_id="a1", action_type="check_host",
+        payload={"host_ref": {"type": "netbox", "netbox_device_id": 9999}},
+        queued_at="t0", expires_at="2099-01-01T00:00:00Z",
+    )
+    with caplog.at_level("INFO"):
+        handler(ctx)
+
+    assert check_called["n"] == 0
+    assert submit_called["n"] == 0
+    skip_logs = [r.msg for r in caplog.records
+                 if isinstance(r.msg, dict) and r.msg.get("event") == "action_check_host_netbox_id_not_found"]
+    assert len(skip_logs) == 1
+    assert skip_logs[0]["netbox_device_id"] == 9999
+    assert skip_logs[0]["current_netbox_hosts_count"] == 0
+
+
+def test_check_host_netbox_ref_skips_when_state_is_none(client, caplog):
+    """If NetBox isn't configured at all (state is None — possible in
+    older runner code paths or test setups), the handler still skips
+    cleanly via the same not-found log event with count=0."""
+    check_called = {"n": 0}
+
+    def fake_check(*a, **k):
+        check_called["n"] += 1
+
+    handler = make_check_host_handler(
+        client=client, data_dir="/tmp",
+        config_state=ConfigState(initial=dict(INITIAL_CONFIG)),
+        clock=FakeClock(), shutdown_event=threading.Event(),
+        check_fn=fake_check, submit_fn=lambda **k: None,
+        netbox_hosts_state=None,
     )
     ctx = ActionContext(
         action_id="a1", action_type="check_host",
         payload={"host_ref": {"type": "netbox", "netbox_device_id": 1247}},
         queued_at="t0", expires_at="2099-01-01T00:00:00Z",
     )
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("INFO"):
         handler(ctx)
 
     assert check_called["n"] == 0
-    assert submit_called["n"] == 0
-    not_supported = [r.msg for r in caplog.records
-                     if isinstance(r.msg, dict) and r.msg.get("event") == "action_check_host_netbox_not_yet_supported"]
-    assert len(not_supported) == 1
-    assert not_supported[0]["netbox_device_id"] == 1247
+    skip_logs = [r.msg for r in caplog.records
+                 if isinstance(r.msg, dict) and r.msg.get("event") == "action_check_host_netbox_id_not_found"]
+    assert len(skip_logs) == 1
+    assert skip_logs[0]["current_netbox_hosts_count"] == 0
 
 
 # ============================================================

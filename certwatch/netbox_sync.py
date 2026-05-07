@@ -17,7 +17,7 @@ import dataclasses
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Sequence
 
 from certwatch.clock import Clock, RealClock, utc_now_iso
 from certwatch.dashboard_client import (
@@ -34,6 +34,40 @@ from certwatch.netbox_client import (
     NetBoxClient,
     NetBoxSyncError,
 )
+
+
+class NetBoxHostsState:
+    """Thread-safe holder for the agent's local view of NetBox-discovered
+    hosts.
+
+    Written by NetBoxSyncThread after every SUCCESSFUL NetBox fetch
+    (regardless of whether the subsequent /discovered-hosts submission
+    to the dashboard succeeds — the agent's cert-check loop should
+    always see the freshest set NetBox returned, even when the
+    dashboard temporarily can't be told about it).
+
+    Read by:
+      - CertCheckThread (every cycle, to merge with manual_hosts)
+      - the check_host action handler (on-demand, to resolve a netbox
+        host_ref's netbox_device_id to (hostname, port))
+
+    snapshot() returns a fresh list copy — different from ConfigState's
+    return-by-reference. Callers iterate this list while holding no
+    lock; defensive copy prevents a concurrent replace() from
+    invalidating iteration.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._hosts: list[DiscoveredHost] = []
+
+    def replace(self, hosts: Sequence[DiscoveredHost]) -> None:
+        with self._lock:
+            self._hosts = list(hosts)
+
+    def snapshot(self) -> list[DiscoveredHost]:
+        with self._lock:
+            return list(self._hosts)
 
 log = logging.getLogger("certwatch")
 
@@ -59,8 +93,17 @@ def run_netbox_sync(
     stats_state: StatsState,
     clock: Optional[Clock] = None,
     shutdown_event: Optional[threading.Event] = None,
+    netbox_hosts_state: Optional[NetBoxHostsState] = None,
 ) -> NetBoxSyncResult:
-    """Run one sync: fetch from NetBox → submit to dashboard.
+    """Run one sync: fetch from NetBox → update agent-local state →
+    submit to dashboard.
+
+    Local-state update happens IMMEDIATELY after a successful fetch and
+    BEFORE the dashboard submission. The cycle thread reads the state
+    on its own cadence, so even if the /discovered-hosts submission
+    fails (or shutdown signals mid-retry), the agent still cert-checks
+    whatever NetBox most-recently reported. The dashboard's view may
+    lag temporarily; it converges on the next successful submission.
 
     Auth errors during submission are RE-RAISED — the caller (action
     pool dispatcher or NetBoxSyncThread) is responsible for triggering
@@ -75,7 +118,9 @@ def run_netbox_sync(
         hosts = netbox_client.fetch_hosts()
     except NetBoxSyncError as e:
         # Safety contract: NetBox failure → do NOT call /discovered-hosts.
-        # The dashboard's last known state is preserved.
+        # Local state stays at last-known (no replace call), so cycle
+        # thread continues cert-checking the previous host set rather
+        # than silently going dark on every NetBox blip.
         log.error(
             {
                 "event": "netbox_sync_netbox_error_preserving_state",
@@ -84,6 +129,14 @@ def run_netbox_sync(
             }
         )
         return NetBoxSyncResult(status="netbox_error", hosts_count=0)
+
+    # Update local state on EVERY successful fetch — even if the
+    # subsequent submission to the dashboard fails. The cycle thread
+    # cares about cert-checking the freshest set; the dashboard's
+    # discovered-hosts table is a separate concern that converges
+    # later.
+    if netbox_hosts_state is not None:
+        netbox_hosts_state.replace(hosts)
 
     payload_hosts = [_host_to_payload(h) for h in hosts]
 
@@ -259,6 +312,7 @@ class NetBoxSyncThread(threading.Thread):
         stats_state: StatsState,
         shutdown_event: threading.Event,
         clock: Clock,
+        netbox_hosts_state: Optional[NetBoxHostsState] = None,
         auth_error_event: Optional[threading.Event] = None,
         name: str = "certwatch-netbox-sync",
     ) -> None:
@@ -267,6 +321,7 @@ class NetBoxSyncThread(threading.Thread):
         self._dashboard_client = dashboard_client
         self._config_state = config_state
         self._stats_state = stats_state
+        self._netbox_hosts_state = netbox_hosts_state
         self._shutdown_event = shutdown_event
         self._auth_error_event = auth_error_event
         self._clock = clock
@@ -283,6 +338,7 @@ class NetBoxSyncThread(threading.Thread):
                         stats_state=self._stats_state,
                         clock=self._clock,
                         shutdown_event=self._shutdown_event,
+                        netbox_hosts_state=self._netbox_hosts_state,
                     )
                 except DashboardAuthError as e:
                     log.error(

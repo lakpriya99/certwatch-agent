@@ -537,3 +537,140 @@ def test_scenario_10_sigterm_during_cycle_completes_and_submits(
     cycle_report = reports[0]
     assert len(cycle_report["checks"]) == 1
     assert cycle_report["checks"][0]["status"] == "connection_failed"
+
+
+# ============================================================
+#  Scenario 11: NetBox-discovered hosts get cert-checked
+# ============================================================
+
+
+def test_scenario_11_netbox_hosts_are_cert_checked_in_periodic_cycle(
+    mock_dashboard, mock_netbox, agent_factory, fresh_data_dir,
+):
+    """Regression test for the production bug where NetBox sync only
+    populated dashboard inventory but the cycle thread never actually
+    cert-checked the discovered hosts. With the fix, NetBox hosts go
+    through the same cert-check pipeline as manual hosts."""
+    mock_dashboard.add_valid_registration_token(REGISTRATION_TOKEN)
+    # NetBox device with a closed-port hostname → cert_check completes
+    # quickly with status=connection_failed (we're testing the wire
+    # flow, not the success path).
+    mock_netbox.add_device(
+        netbox_device_id=1247, name="esxi02.lab",
+        primary_ip4="127.0.0.1/32",  # local + closed port via custom_field
+        custom_fields={"cert_check_port": 9},  # discard port — closed
+        tags=["monitor-cert"],
+    )
+
+    env = _base_env(mock_dashboard, extra={
+        "NETBOX_URL": mock_netbox.url,
+        "NETBOX_TOKEN": "nbtok_test",
+        "NETBOX_FILTER": "tag=monitor-cert",
+    })
+
+    agent = agent_factory(env=env, data_dir=fresh_data_dir)
+    agent.wait_for_event("agent_running", timeout=10.0)
+
+    # Wait for a cycle's report to land that contains a NetBox host_ref.
+    # The first cycle may run before NetBox sync completes (race), so
+    # we wait for a report with a netbox check specifically.
+    def has_netbox_check():
+        for report in mock_dashboard.received_reports():
+            for check in (report.get("checks") or []):
+                ref = check.get("host_ref") or {}
+                if ref.get("type") == "netbox":
+                    return True
+        return False
+
+    _wait_until(has_netbox_check, timeout=20.0)
+
+    # Verify the netbox check made it to the dashboard with the right shape
+    netbox_checks = []
+    for report in mock_dashboard.received_reports():
+        for check in (report.get("checks") or []):
+            if (check.get("host_ref") or {}).get("type") == "netbox":
+                netbox_checks.append(check)
+    assert netbox_checks, "expected at least one netbox host_ref in reports"
+    nc = netbox_checks[0]
+    assert nc["host_ref"]["netbox_device_id"] == 1247
+    # Closed port → connection_failed (status from real cert_check)
+    assert nc["status"] == "connection_failed"
+
+    rc = agent.stop(timeout=10.0)
+    assert rc == 0
+
+
+def test_scenario_12_check_now_on_netbox_host_succeeds(
+    mock_dashboard, mock_netbox, agent_factory, fresh_data_dir,
+):
+    """The "Check Now" button on a NetBox host's detail page queues a
+    check_host action with a netbox host_ref. The agent's action
+    handler must resolve it via NetBoxHostsState and submit an
+    on_demand report. Pre-fix, the handler logged
+    'action_check_host_netbox_not_yet_supported' and did nothing."""
+    mock_dashboard.add_valid_registration_token(REGISTRATION_TOKEN)
+    mock_netbox.add_device(
+        netbox_device_id=1247, name="esxi02.lab",
+        primary_ip4="127.0.0.1/32",
+        custom_fields={"cert_check_port": 9},
+        tags=["monitor-cert"],
+    )
+
+    env = _base_env(mock_dashboard, extra={
+        "NETBOX_URL": mock_netbox.url,
+        "NETBOX_TOKEN": "nbtok_test",
+        "NETBOX_FILTER": "tag=monitor-cert",
+    })
+    agent = agent_factory(env=env, data_dir=fresh_data_dir)
+    agent.wait_for_event("agent_running", timeout=10.0)
+
+    # Wait for the first NetBox sync to populate local state, otherwise
+    # the action handler can't resolve the netbox_device_id.
+    _wait_until(
+        lambda: len(mock_dashboard.received_discovered_hosts()) >= 1,
+        timeout=15.0,
+    )
+
+    # Queue Check Now on the NetBox host.
+    action_id = mock_dashboard.queue_action(
+        "check_host",
+        payload={"host_ref": {
+            "type": "netbox", "netbox_device_id": 1247,
+        }},
+    )
+
+    # The agent should pick it up via heartbeat and submit an on_demand
+    # report with the action_id echoed.
+    _wait_until(
+        lambda: any(
+            r.get("action_id") == action_id
+            for r in mock_dashboard.received_reports()
+        ),
+        timeout=20.0,
+    )
+
+    on_demand = next(
+        r for r in mock_dashboard.received_reports()
+        if r.get("action_id") == action_id
+    )
+    assert on_demand["report_type"] == "on_demand"
+    assert on_demand["action_id"] == action_id
+    assert len(on_demand["checks"]) == 1
+    check = on_demand["checks"][0]
+    assert check["host_ref"]["type"] == "netbox"
+    assert check["host_ref"]["netbox_device_id"] == 1247
+    # Real cert_check ran against the resolved hostname:port
+    assert check["status"] in ("connection_failed", "tls_failed", "success")
+
+    # No "not yet supported" log — proves the new resolution path ran
+    not_supported = [
+        ev for ev in agent.events()
+        if ev.get("event") == "action_check_host_netbox_not_yet_supported"
+    ]
+    assert not_supported == [], (
+        "the obsolete not-yet-supported event should never fire — "
+        "it would mean the netbox-resolution path didn't run"
+    )
+
+    rc = agent.stop(timeout=10.0)
+    assert rc == 0

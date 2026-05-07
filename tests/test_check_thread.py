@@ -73,7 +73,7 @@ def _delivered(report_id: str = "abc") -> ReportSubmissionResult:
     )
 
 
-def _build_thread(client, *, fc=None, config=None, stats=None,
+def _build_thread(client, *, fc=None, config=None, stats=None, netbox=None,
                    shutdown=None, check_fn=None, submit_fn=None):
     fc = fc or FakeClock()
     config_state = config or ConfigState(initial=dict(INITIAL_CONFIG))
@@ -86,6 +86,7 @@ def _build_thread(client, *, fc=None, config=None, stats=None,
         config_state=config_state, stats_state=stats_state,
         shutdown_event=shutdown_event, clock=fc,
         check_fn=check_fn, submit_fn=submit_fn,
+        netbox_hosts_state=netbox,
     )
     return thread, config_state, stats_state, shutdown_event
 
@@ -852,3 +853,214 @@ def test_thread_exits_on_unhandled_exception_setting_shutdown(client, caplog):
     errors = [r.msg for r in caplog.records
               if isinstance(r.msg, dict) and r.msg.get("event") == "check_cycle_unexpected_error"]
     assert len(errors) >= 1
+
+
+# ============================================================
+#  NetBox-discovered hosts in the cycle (regression for the
+#  "NetBox sync but no cert checks" production bug)
+# ============================================================
+
+
+def _netbox_host(device_id, hostname, port=443, tags=None):
+    from certwatch.netbox_client import DiscoveredHost
+    return DiscoveredHost(
+        netbox_device_id=device_id, hostname=hostname, port=port,
+        display_name=f"d{device_id}", tags=tags or [],
+    )
+
+
+def test_cycle_iterates_netbox_hosts_alongside_manual(client):
+    """Regression test for the bug where the cycle iterated only
+    manual_hosts and never cert-checked NetBox-discovered hosts.
+
+    Both sources go through the same cert-check pipeline; only the
+    host_ref shape in the report differs."""
+    from certwatch.netbox_sync import NetBoxHostsState
+
+    fc = FakeClock()
+    config = {**INITIAL_CONFIG, "manual_hosts": [
+        {"host_id": "manual-1", "hostname": "manual.example", "port": 443,
+         "added_at": "t"},
+    ]}
+    netbox_state = NetBoxHostsState()
+    netbox_state.replace([
+        _netbox_host(1247, "esxi02.lab"),
+        _netbox_host(1248, "switch01.lab", port=8443),
+    ])
+
+    captured = {}
+    checked_hosts = []
+
+    def fake_check(host, port, **k):
+        checked_hosts.append((host, port))
+        return _success_result(host, port)
+
+    def fake_submit(**k):
+        captured["checks"] = k["checks"]
+        k["shutdown_event"].set()
+        return _delivered()
+
+    thread, _, _, shutdown = _build_thread(
+        client, fc=fc, config=ConfigState(initial=config),
+        netbox=netbox_state, check_fn=fake_check, submit_fn=fake_submit,
+    )
+    try:
+        thread.start()
+        thread.join(timeout=2.0)
+    finally:
+        _stop_thread(thread, shutdown)
+
+    # All three hosts cert-checked
+    assert len(checked_hosts) == 3
+    assert ("manual.example", 443) in checked_hosts
+    assert ("esxi02.lab", 443) in checked_hosts
+    assert ("switch01.lab", 8443) in checked_hosts
+
+    # Report contains all three checks with correct host_ref types
+    checks = captured["checks"]
+    assert len(checks) == 3
+    types = [(c["host_ref"]["type"], c["host_ref"]) for c in checks]
+    assert ("manual", {"type": "manual", "host_id": "manual-1"}) in types
+    assert ("netbox", {"type": "netbox", "netbox_device_id": 1247}) in types
+    assert ("netbox", {"type": "netbox", "netbox_device_id": 1248}) in types
+
+
+def test_cycle_with_only_netbox_hosts_no_manual(client):
+    """A homelab agent with only NetBox-sourced hosts (no manual_hosts
+    on the dashboard) should still cert-check everything from NetBox."""
+    from certwatch.netbox_sync import NetBoxHostsState
+
+    fc = FakeClock()
+    config = {**INITIAL_CONFIG, "manual_hosts": []}
+    netbox_state = NetBoxHostsState()
+    netbox_state.replace([_netbox_host(1247, "esxi02.lab")])
+
+    captured = {}
+
+    def fake_submit(**k):
+        captured["checks"] = k["checks"]
+        k["shutdown_event"].set()
+        return _delivered()
+
+    thread, _, _, shutdown = _build_thread(
+        client, fc=fc, config=ConfigState(initial=config),
+        netbox=netbox_state, submit_fn=fake_submit,
+    )
+    try:
+        thread.start()
+        thread.join(timeout=2.0)
+    finally:
+        _stop_thread(thread, shutdown)
+
+    checks = captured["checks"]
+    assert len(checks) == 1
+    assert checks[0]["host_ref"]["type"] == "netbox"
+    assert checks[0]["host_ref"]["netbox_device_id"] == 1247
+
+
+def test_cycle_summary_log_includes_separate_manual_and_netbox_counts(client, caplog):
+    """check_cycle_summary log must distinguish the two sources so
+    operators can tell at a glance what's being checked. This is also
+    how we'd have spotted the original bug — with the count visible,
+    the all-zero netbox count would have been a red flag."""
+    from certwatch.netbox_sync import NetBoxHostsState
+
+    fc = FakeClock()
+    config = {**INITIAL_CONFIG, "manual_hosts": [
+        {"host_id": "m1", "hostname": "m1", "port": 443, "added_at": "t"},
+    ]}
+    netbox_state = NetBoxHostsState()
+    netbox_state.replace([
+        _netbox_host(1247, "n1"),
+        _netbox_host(1248, "n2"),
+    ])
+
+    def fake_submit(**k):
+        k["shutdown_event"].set()
+        return _delivered()
+
+    thread, _, _, shutdown = _build_thread(
+        client, fc=fc, config=ConfigState(initial=config),
+        netbox=netbox_state, submit_fn=fake_submit,
+    )
+    try:
+        with caplog.at_level("INFO"):
+            thread.start()
+            thread.join(timeout=2.0)
+    finally:
+        _stop_thread(thread, shutdown)
+
+    summaries = [r.msg for r in caplog.records
+                 if isinstance(r.msg, dict) and r.msg.get("event") == "check_cycle_summary"]
+    assert len(summaries) >= 1
+    s = summaries[0]
+    assert s["manual_hosts_count"] == 1
+    assert s["netbox_hosts_count"] == 2
+    assert s["total_hosts_count"] == 3
+
+
+def test_cycle_with_no_netbox_state_passed_works_unchanged(client):
+    """Backward compat: existing callers that don't pass netbox_hosts_state
+    (e.g., test fixtures from before this change) still work — the
+    cycle just iterates manual_hosts only."""
+    fc = FakeClock()
+    captured = {}
+
+    def fake_submit(**k):
+        captured["checks"] = k["checks"]
+        k["shutdown_event"].set()
+        return _delivered()
+
+    thread, _, _, shutdown = _build_thread(client, fc=fc, submit_fn=fake_submit)
+    try:
+        thread.start()
+        thread.join(timeout=2.0)
+    finally:
+        _stop_thread(thread, shutdown)
+
+    # Default INITIAL_CONFIG has 2 manual hosts
+    assert len(captured["checks"]) == 2
+    assert all(c["host_ref"]["type"] == "manual" for c in captured["checks"])
+
+
+def test_cycle_preserves_manual_first_then_netbox_order(client):
+    """Order in the report: manual hosts first (in config order), then
+    netbox hosts (in state order). Important for the dashboard's UI
+    to display per-cycle results in a stable way."""
+    from certwatch.netbox_sync import NetBoxHostsState
+
+    fc = FakeClock()
+    config = {**INITIAL_CONFIG, "manual_hosts": [
+        {"host_id": "ma", "hostname": "ma", "port": 443, "added_at": "t"},
+        {"host_id": "mb", "hostname": "mb", "port": 443, "added_at": "t"},
+    ]}
+    netbox_state = NetBoxHostsState()
+    netbox_state.replace([
+        _netbox_host(100, "nx"),
+        _netbox_host(200, "ny"),
+    ])
+
+    captured = {}
+
+    def fake_submit(**k):
+        captured["checks"] = k["checks"]
+        k["shutdown_event"].set()
+        return _delivered()
+
+    thread, _, _, shutdown = _build_thread(
+        client, fc=fc, config=ConfigState(initial=config),
+        netbox=netbox_state, submit_fn=fake_submit,
+    )
+    try:
+        thread.start()
+        thread.join(timeout=2.0)
+    finally:
+        _stop_thread(thread, shutdown)
+
+    refs = [c["host_ref"] for c in captured["checks"]]
+    assert refs == [
+        {"type": "manual", "host_id": "ma"},
+        {"type": "manual", "host_id": "mb"},
+        {"type": "netbox", "netbox_device_id": 100},
+        {"type": "netbox", "netbox_device_id": 200},
+    ]

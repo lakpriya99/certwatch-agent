@@ -278,6 +278,7 @@ def make_check_host_handler(
     shutdown_event: threading.Event,
     check_fn: Callable = default_cert_check,
     submit_fn: Callable = default_submit,
+    netbox_hosts_state=None,  # Optional[NetBoxHostsState]
 ) -> ActionHandler:
     """Returns the check_host action handler.
 
@@ -287,6 +288,13 @@ def make_check_host_handler(
     `check_fn` and `submit_fn` are injectable for unit testing — same
     pattern Phase 3's check_loop established. Production code uses the
     defaults.
+
+    `netbox_hosts_state` is the agent's local view of NetBox-discovered
+    hosts (written by NetBoxSyncThread, read here for on-demand
+    cert-check resolution). When None, "netbox" host_refs can't be
+    resolved — the handler logs and skips. When set, the handler looks
+    up the matching netbox_device_id in the snapshot and runs the same
+    cert-check pipeline as for manual hosts.
     """
 
     def handle(ctx: ActionContext) -> None:
@@ -311,15 +319,28 @@ def make_check_host_handler(
                 return
             hostname, port = resolved
         elif ref_type == "netbox":
-            # Phase 6 will replace this branch with real NetBox state lookup.
-            log.warning(
-                {
-                    "event": "action_check_host_netbox_not_yet_supported",
-                    "action_id": ctx.action_id,
-                    "netbox_device_id": host_ref.get("netbox_device_id"),
-                }
+            netbox_id = host_ref.get("netbox_device_id")
+            netbox_hosts = (
+                netbox_hosts_state.snapshot()
+                if netbox_hosts_state is not None
+                else []
             )
-            return
+            matching = next(
+                (h for h in netbox_hosts if h.netbox_device_id == netbox_id),
+                None,
+            )
+            if matching is None:
+                log.info(
+                    {
+                        "event": "action_check_host_netbox_id_not_found",
+                        "action_id": ctx.action_id,
+                        "netbox_device_id": netbox_id,
+                        "current_netbox_hosts_count": len(netbox_hosts),
+                    }
+                )
+                return
+            hostname = matching.hostname
+            port = matching.port
         else:
             log.warning(
                 {

@@ -625,3 +625,129 @@ def test_netbox_sync_thread_netbox_error_does_not_stop_thread(dashboard_client, 
     netbox_errors = [r.msg for r in caplog.records
                       if isinstance(r.msg, dict) and r.msg.get("event") == "netbox_sync_netbox_error_preserving_state"]
     assert len(netbox_errors) == 1
+
+
+# ============================================================
+#  NetBoxHostsState (in-memory state for cycle + action consumers)
+# ============================================================
+
+
+def test_netbox_hosts_state_starts_empty():
+    from certwatch.netbox_sync import NetBoxHostsState
+    state = NetBoxHostsState()
+    assert state.snapshot() == []
+
+
+def test_netbox_hosts_state_replace_swaps_full_list():
+    from certwatch.netbox_sync import NetBoxHostsState
+    state = NetBoxHostsState()
+    state.replace([
+        DiscoveredHost(netbox_device_id=1, hostname="a", port=443, display_name="A", tags=[]),
+        DiscoveredHost(netbox_device_id=2, hostname="b", port=8443, display_name="B", tags=["x"]),
+    ])
+    snap = state.snapshot()
+    assert len(snap) == 2
+    assert snap[0].netbox_device_id == 1
+    assert snap[1].port == 8443
+
+
+def test_netbox_hosts_state_snapshot_returns_independent_list():
+    """Different from ConfigState (which returns by reference). Callers
+    iterate netbox_hosts in the cycle thread; we don't want a concurrent
+    replace() to invalidate iteration."""
+    from certwatch.netbox_sync import NetBoxHostsState
+    state = NetBoxHostsState()
+    state.replace([
+        DiscoveredHost(netbox_device_id=1, hostname="a", port=443, display_name=None, tags=[]),
+    ])
+    snap1 = state.snapshot()
+    state.replace([])  # concurrent writer would drop everything
+    # snap1 must still have its original contents
+    assert len(snap1) == 1
+    assert snap1[0].hostname == "a"
+
+
+def test_run_netbox_sync_updates_local_state_on_successful_fetch(dashboard_client, stats):
+    """The cycle thread reads NetBoxHostsState; it must be updated with
+    fresh data on every successful fetch so the next cycle cert-checks
+    the latest set."""
+    from certwatch.netbox_sync import NetBoxHostsState
+
+    nb = _fake_netbox_client(_hosts((1, "10.0.0.1", 443), (2, "10.0.0.2", 8443)))
+    state = NetBoxHostsState()
+    assert state.snapshot() == []  # initial empty
+
+    with responses.RequestsMock() as rsps:
+        rsps.add("POST", DISCOVERED_URL, json=OK_RESPONSE, status=200)
+        run_netbox_sync(
+            netbox_client=nb, dashboard_client=dashboard_client,
+            action_id=None, stats_state=stats, clock=FakeClock(),
+            netbox_hosts_state=state,
+        )
+
+    snap = state.snapshot()
+    assert len(snap) == 2
+    assert snap[0].hostname == "10.0.0.1"
+    assert snap[1].port == 8443
+
+
+def test_run_netbox_sync_does_not_update_state_on_netbox_error(dashboard_client, stats):
+    """Safety contract: NetBox failure preserves last-known state. The
+    cycle thread keeps cert-checking what it had rather than going dark."""
+    from certwatch.netbox_sync import NetBoxHostsState
+
+    state = NetBoxHostsState()
+    # Pre-populate with a previous-sync result.
+    previous_hosts = _hosts((1, "10.0.0.1", 443))
+    state.replace(previous_hosts)
+
+    nb = _fake_netbox_client(
+        raise_on_fetch=NetBoxSyncError(
+            "connection refused",
+            original_error=requests.ConnectionError("ECONNREFUSED"),
+        ),
+    )
+
+    with responses.RequestsMock():
+        result = run_netbox_sync(
+            netbox_client=nb, dashboard_client=dashboard_client,
+            action_id=None, stats_state=stats, clock=FakeClock(),
+            netbox_hosts_state=state,
+        )
+
+    assert result.status == "netbox_error"
+    # State unchanged — cycle thread continues with the previous host list
+    snap = state.snapshot()
+    assert len(snap) == 1
+    assert snap[0] == previous_hosts[0]
+
+
+def test_run_netbox_sync_updates_state_even_when_dashboard_submission_fails(
+    dashboard_client, stats
+):
+    """Local state and dashboard state are independent purposes. NetBox
+    fetch succeeded → cycle thread should cert-check the fresh set
+    immediately, regardless of whether /discovered-hosts submission
+    landed. Dashboard view may temporarily lag; it converges later."""
+    from certwatch.netbox_sync import NetBoxHostsState
+
+    nb = _fake_netbox_client(_hosts((1, "10.0.0.1", 443), (2, "10.0.0.2", 8443)))
+    state = NetBoxHostsState()
+    fc = FakeClock()
+
+    err = {"error": {"code": "validation_failed",
+                      "message": "duplicate", "request_id": "req_v"}}
+
+    with responses.RequestsMock() as rsps:
+        rsps.add("POST", DISCOVERED_URL, json=err, status=400)
+        result = run_netbox_sync(
+            netbox_client=nb, dashboard_client=dashboard_client,
+            action_id=None, stats_state=stats, clock=fc,
+            netbox_hosts_state=state,
+        )
+
+    # Submission failed but local state still got the fresh set.
+    assert result.status == "submission_error"
+    snap = state.snapshot()
+    assert len(snap) == 2
+    assert {h.netbox_device_id for h in snap} == {1, 2}

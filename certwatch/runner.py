@@ -48,7 +48,7 @@ from certwatch.clock import Clock, RealClock
 from certwatch.dashboard_client import DashboardAuthError
 from certwatch.heartbeat_thread import ConfigState, HeartbeatThread, StatsState
 from certwatch.netbox_client import NetBoxClient, _parse_netbox_verify_ssl_env
-from certwatch.netbox_sync import NetBoxSyncThread
+from certwatch.netbox_sync import NetBoxHostsState, NetBoxSyncThread
 from certwatch.report_submission import replay_pending_reports
 
 log = logging.getLogger("certwatch")
@@ -174,6 +174,11 @@ class AgentRunner:
         config_state = ConfigState(initial=bootstrap_result.initial_config)
         stats_state = StatsState(clock=self.clock)
         action_queue: "queue.Queue[dict]" = queue.Queue()
+        # Always construct NetBoxHostsState — when NetBox is not
+        # configured, snapshot() returns [] and the cycle iterates only
+        # manual_hosts. Always-present state simplifies wiring (no
+        # conditional None passing) and the empty-list path is harmless.
+        netbox_hosts_state = NetBoxHostsState()
 
         # 3a. Construct NetBoxClient if configured (Phase 6).
         netbox_client = self._build_netbox_client_if_configured()
@@ -185,6 +190,7 @@ class AgentRunner:
             config_state=config_state,
             clock=self.clock,
             shutdown_event=self._shutdown_event,
+            netbox_hosts_state=netbox_hosts_state,
         )
         sync_netbox_handler = make_sync_netbox_handler(
             netbox_client=netbox_client,
@@ -224,6 +230,7 @@ class AgentRunner:
             shutdown_event=self._shutdown_event,
             auth_error_event=self._auth_error_event,
             clock=self.clock,
+            netbox_hosts_state=netbox_hosts_state,
         )
 
         netbox_thread: Optional[NetBoxSyncThread] = None
@@ -236,6 +243,7 @@ class AgentRunner:
                 shutdown_event=self._shutdown_event,
                 auth_error_event=self._auth_error_event,
                 clock=self.clock,
+                netbox_hosts_state=netbox_hosts_state,
             )
 
         # 5. Install signal handlers. Main-thread only; in tests we run
