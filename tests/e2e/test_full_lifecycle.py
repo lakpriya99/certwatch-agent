@@ -550,13 +550,18 @@ def test_scenario_11_netbox_hosts_are_cert_checked_in_periodic_cycle(
     """Regression test for the production bug where NetBox sync only
     populated dashboard inventory but the cycle thread never actually
     cert-checked the discovered hosts. With the fix, NetBox hosts go
-    through the same cert-check pipeline as manual hosts."""
+    through the cert-discovery pipeline (Phase 9c) — connect by IP,
+    discover the cert-presented hostname.
+
+    Wire shape (Phase 9b/9c compat envelope): netbox checks carry
+    `status_detail` with the precise 9-value enum alongside the legacy
+    3-value `status` for backward compatibility."""
     mock_dashboard.add_valid_registration_token(REGISTRATION_TOKEN)
-    # NetBox device with a closed-port hostname → cert_check completes
-    # quickly with status=connection_failed (we're testing the wire
-    # flow, not the success path).
+    # NetBox device with a closed-port IP → discovery completes quickly
+    # with status=connection_refused (testing the wire flow, not the
+    # success path — cert-discovery success requires a real TLS target).
     mock_netbox.add_device(
-        netbox_device_id=1247, name="localhost",  # resolves to 127.0.0.1
+        netbox_device_id=1247, name="localhost",
         primary_ip4="127.0.0.1/32",
         custom_fields={"cert_check_port": 9},  # discard port — closed
         tags=["monitor-cert"],
@@ -593,8 +598,12 @@ def test_scenario_11_netbox_hosts_are_cert_checked_in_periodic_cycle(
     assert netbox_checks, "expected at least one netbox host_ref in reports"
     nc = netbox_checks[0]
     assert nc["host_ref"]["netbox_device_id"] == 1247
-    # Closed port → connection_failed (status from real cert_check)
+    # Compat envelope: legacy `status` for old dashboards, precise
+    # `status_detail` for new ones. Closed port → connection_refused.
     assert nc["status"] == "connection_failed"
+    assert nc["status_detail"] == "connection_refused"
+    # No cert recovered on a connection-family failure.
+    assert nc["cert"] is None
 
     rc = agent.stop(timeout=10.0)
     assert rc == 0
@@ -659,8 +668,18 @@ def test_scenario_12_check_now_on_netbox_host_succeeds(
     check = on_demand["checks"][0]
     assert check["host_ref"]["type"] == "netbox"
     assert check["host_ref"]["netbox_device_id"] == 1247
-    # Real cert_check ran against the resolved hostname:port
+    # Cert-discovery ran against the resolved IP:port. Compat envelope:
+    # legacy `status` + precise `status_detail` from Phase 9b.
     assert check["status"] in ("connection_failed", "tls_failed", "success")
+    assert "status_detail" in check, (
+        "netbox-path checks must carry status_detail (compat envelope)"
+    )
+    assert check["status_detail"] in (
+        "connection_refused", "connection_timeout",
+        "tls_failed_no_cert", "tls_failed_malformed_cert",
+        "cert_expired", "cert_no_usable_hostname", "tls_warning",
+        "cert_expiring_soon", "success",
+    )
 
     # No "not yet supported" log — proves the new resolution path ran
     not_supported = [
@@ -671,6 +690,84 @@ def test_scenario_12_check_now_on_netbox_host_succeeds(
         "the obsolete not-yet-supported event should never fire — "
         "it would mean the netbox-resolution path didn't run"
     )
+
+    rc = agent.stop(timeout=10.0)
+    assert rc == 0
+
+
+# ============================================================
+#  Scenario 13: NetBox device with no primary_ip falls back to hostname
+# ============================================================
+
+
+def test_scenario_13_netbox_host_without_primary_ip_falls_back_to_hostname(
+    mock_dashboard, mock_netbox, agent_factory, fresh_data_dir,
+):
+    """NetBox devices that don't have primary_ip4/6 set (newly-added,
+    or operator hasn't filled it in yet) must still get cert-checked
+    using device.name as the connect target. Phase 9c's per-source
+    dispatch picks `ip_address or hostname` — this scenario exercises
+    the hostname-fallback half.
+
+    Production matters because real NetBox deployments routinely have
+    devices in inventory without primary_ip set (host added before its
+    network plumbing is finalized). Skipping these would silently drop
+    them from monitoring."""
+    mock_dashboard.add_valid_registration_token(REGISTRATION_TOKEN)
+    # NO primary_ip4. name="localhost" is reachable; port 9 closed →
+    # connection_refused (fast).
+    mock_netbox.add_device(
+        netbox_device_id=1300, name="localhost",
+        custom_fields={"cert_check_port": 9},
+        tags=["monitor-cert"],
+    )
+
+    env = _base_env(mock_dashboard, extra={
+        "NETBOX_URL": mock_netbox.url,
+        "NETBOX_TOKEN": "nbtok_test",
+        "NETBOX_FILTER": "tag=monitor-cert",
+    })
+
+    agent = agent_factory(env=env, data_dir=fresh_data_dir)
+    agent.wait_for_event("agent_running", timeout=10.0)
+
+    # First, verify the discovered-hosts payload reflects the missing IP
+    # (regression: an earlier bug populated ip_address from hostname).
+    _wait_until(
+        lambda: len(mock_dashboard.received_discovered_hosts()) >= 1,
+        timeout=15.0,
+    )
+    sync = mock_dashboard.received_discovered_hosts()[0]
+    h = next(h for h in sync["hosts"] if h["netbox_device_id"] == 1300)
+    # Missing primary_ip → no ip_address in the discovered-hosts payload
+    # (or null, depending on the wire shape).
+    assert h.get("ip_address") in (None, "")
+
+    # Wait for a netbox check to land in a cycle's report.
+    def has_check_for_1300():
+        for report in mock_dashboard.received_reports():
+            for check in (report.get("checks") or []):
+                ref = check.get("host_ref") or {}
+                if (ref.get("type") == "netbox"
+                        and ref.get("netbox_device_id") == 1300):
+                    return True
+        return False
+
+    _wait_until(has_check_for_1300, timeout=20.0)
+
+    # The cert-discovery still ran (fallback path) and produced a
+    # connection_refused — which is only possible if the agent
+    # successfully resolved "localhost" to 127.0.0.1 and connected.
+    matching = []
+    for report in mock_dashboard.received_reports():
+        for check in (report.get("checks") or []):
+            ref = check.get("host_ref") or {}
+            if (ref.get("type") == "netbox"
+                    and ref.get("netbox_device_id") == 1300):
+                matching.append(check)
+    assert matching
+    assert matching[0]["status"] == "connection_failed"
+    assert matching[0]["status_detail"] == "connection_refused"
 
     rc = agent.stop(timeout=10.0)
     assert rc == 0

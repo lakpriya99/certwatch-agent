@@ -10,6 +10,15 @@ Default config has aggressive intervals (1s heartbeat, 5s check,
 5s netbox sync) so the e2e suite completes in under 2 minutes of
 real time — the agent honors whatever intervals the dashboard hands
 back, so this is the speed knob for the whole suite.
+
+Additive-fields compatibility: the /reports validator counts only
+`status` (legacy 3-value enum) for its summary and stores the entire
+body verbatim. New fields (`status_detail`, `chain_trust_reason`,
+`canonical_hostname`, etc. — Phase 9b's compat envelope) flow
+through as pass-through values. This is the same behavior the real
+Lovable dashboard exhibits — additive fields don't trigger
+validation_failed. Tests that need to assert the new fields read
+them off `received_reports()`.
 """
 
 from __future__ import annotations
