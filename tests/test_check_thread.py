@@ -16,6 +16,7 @@ import uuid
 import pytest
 
 from certwatch.cert_check import CertResult
+from certwatch.cert_check_with_discovery import CertCheckResult
 from certwatch.check_thread import CertCheckThread, CycleResult, _run_one_cycle
 from certwatch.clock import FakeClock
 from certwatch.dashboard_client import DashboardAuthError, DashboardClient
@@ -73,19 +74,42 @@ def _delivered(report_id: str = "abc") -> ReportSubmissionResult:
     )
 
 
+def _success_discovery_result(target: str, port: int = 443) -> CertCheckResult:
+    """Discovery-builder counterpart to `_success_result`. Used by the
+    netbox path after Phase 9c's per-source dispatch."""
+    return CertCheckResult(
+        status="success", ip_address=target, port=port,
+        checked_at="2026-05-02T15:00:03Z",
+        canonical_hostname=target,
+        subject_cn=target, subject_sans=[target],
+        issuer_cn="DigiCert", issuer_o="DigiCert Inc",
+        issuer_full_dn="CN=DigiCert,O=DigiCert Inc",
+        is_self_signed=False,
+        not_before="2025-01-01T00:00:00Z", not_after="2026-12-31T23:59:59Z",
+        days_until_expiry=240, signature_algorithm="SHA256withRSA",
+        key_size=2048, hostname_matches=True,
+        chain_trusted_by_system=True, chain_trust_reason=None,
+    )
+
+
 def _build_thread(client, *, fc=None, config=None, stats=None, netbox=None,
-                   shutdown=None, check_fn=None, submit_fn=None):
+                   shutdown=None, check_fn=None, discovery_check_fn=None,
+                   submit_fn=None):
     fc = fc or FakeClock()
     config_state = config or ConfigState(initial=dict(INITIAL_CONFIG))
     stats_state = stats or StatsState(clock=fc)
     shutdown_event = shutdown or threading.Event()
     check_fn = check_fn or (lambda h, p, **k: _success_result(h, p))
+    discovery_check_fn = discovery_check_fn or (
+        lambda t, p, **k: _success_discovery_result(t, p)
+    )
     submit_fn = submit_fn or (lambda **k: _delivered())
     thread = CertCheckThread(
         client=client, data_dir="/tmp",
         config_state=config_state, stats_state=stats_state,
         shutdown_event=shutdown_event, clock=fc,
-        check_fn=check_fn, submit_fn=submit_fn,
+        check_fn=check_fn, discovery_check_fn=discovery_check_fn,
+        submit_fn=submit_fn,
         netbox_hosts_state=netbox,
     )
     return thread, config_state, stats_state, shutdown_event
@@ -873,8 +897,10 @@ def test_cycle_iterates_netbox_hosts_alongside_manual(client):
     """Regression test for the bug where the cycle iterated only
     manual_hosts and never cert-checked NetBox-discovered hosts.
 
-    Both sources go through the same cert-check pipeline; only the
-    host_ref shape in the report differs."""
+    Phase 9c dispatch: manual hosts go through `check_fn` (old
+    cert_check), netbox hosts go through `discovery_check_fn`
+    (cert_check_with_discovery). Both end up in the same batched
+    /reports payload."""
     from certwatch.netbox_sync import NetBoxHostsState
 
     fc = FakeClock()
@@ -889,11 +915,16 @@ def test_cycle_iterates_netbox_hosts_alongside_manual(client):
     ])
 
     captured = {}
-    checked_hosts = []
+    manual_checked = []
+    discovery_checked = []
 
     def fake_check(host, port, **k):
-        checked_hosts.append((host, port))
+        manual_checked.append((host, port))
         return _success_result(host, port)
+
+    def fake_discovery_check(target, port, **k):
+        discovery_checked.append((target, port))
+        return _success_discovery_result(target, port)
 
     def fake_submit(**k):
         captured["checks"] = k["checks"]
@@ -902,7 +933,9 @@ def test_cycle_iterates_netbox_hosts_alongside_manual(client):
 
     thread, _, _, shutdown = _build_thread(
         client, fc=fc, config=ConfigState(initial=config),
-        netbox=netbox_state, check_fn=fake_check, submit_fn=fake_submit,
+        netbox=netbox_state,
+        check_fn=fake_check, discovery_check_fn=fake_discovery_check,
+        submit_fn=fake_submit,
     )
     try:
         thread.start()
@@ -910,11 +943,13 @@ def test_cycle_iterates_netbox_hosts_alongside_manual(client):
     finally:
         _stop_thread(thread, shutdown)
 
-    # All three hosts cert-checked
-    assert len(checked_hosts) == 3
-    assert ("manual.example", 443) in checked_hosts
-    assert ("esxi02.lab", 443) in checked_hosts
-    assert ("switch01.lab", 8443) in checked_hosts
+    # Manual host went through the old cert_check path
+    assert manual_checked == [("manual.example", 443)]
+    # NetBox hosts went through the new discovery path. _netbox_host
+    # has no ip_address set, so connect_target falls back to hostname.
+    assert ("esxi02.lab", 443) in discovery_checked
+    assert ("switch01.lab", 8443) in discovery_checked
+    assert len(discovery_checked) == 2
 
     # Report contains all three checks with correct host_ref types
     checks = captured["checks"]
@@ -923,6 +958,12 @@ def test_cycle_iterates_netbox_hosts_alongside_manual(client):
     assert ("manual", {"type": "manual", "host_id": "manual-1"}) in types
     assert ("netbox", {"type": "netbox", "netbox_device_id": 1247}) in types
     assert ("netbox", {"type": "netbox", "netbox_device_id": 1248}) in types
+    # NetBox checks carry status_detail (compat envelope); manual ones
+    # don't (old builder).
+    netbox_checks = [c for c in checks if c["host_ref"]["type"] == "netbox"]
+    manual_checks = [c for c in checks if c["host_ref"]["type"] == "manual"]
+    assert all("status_detail" in c for c in netbox_checks)
+    assert all("status_detail" not in c for c in manual_checks)
 
 
 def test_cycle_with_only_netbox_hosts_no_manual(client):

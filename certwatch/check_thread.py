@@ -17,8 +17,12 @@ update into a single threaded loop.
     shutdown_event (same escalation pattern as 5d's action workers); other
     cycle exceptions are logged and the next cycle proceeds.
 
-NetBox-discovered hosts are NOT handled here — Phase 6 will extend the
-host list construction to merge manual_hosts + netbox_hosts.
+Phase 9c cutover: per-source dispatch in the cert-check pipeline.
+Manual hosts call the original `cert_check` (the operator typed an
+FQDN with intent — verify against THAT name). NetBox hosts call
+`cert_check_with_discovery`, which connects by IP and discovers the
+cert-presented hostname (see cert_check_with_discovery's module
+docstring for the why).
 """
 
 from __future__ import annotations
@@ -29,10 +33,17 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 from certwatch.cert_check import CertResult, cert_check as default_cert_check
-from certwatch.check_payload import build_check_payload
+from certwatch.cert_check_with_discovery import (
+    CertCheckResult,
+    cert_check_with_discovery as default_discovery_check,
+)
+from certwatch.check_payload import (
+    build_check_payload,
+    build_check_payload_from_discovery,
+)
 from certwatch.clock import Clock, utc_now_iso
 from certwatch.dashboard_client import DashboardAuthError, DashboardClient
 from certwatch.heartbeat_thread import ConfigState, StatsState
@@ -70,6 +81,7 @@ class CertCheckThread(threading.Thread):
         shutdown_event: threading.Event,
         clock: Clock,
         check_fn: Callable = default_cert_check,
+        discovery_check_fn: Callable = default_discovery_check,
         submit_fn: Callable = default_submit,
         netbox_hosts_state: Optional[NetBoxHostsState] = None,
         auth_error_event: Optional[threading.Event] = None,
@@ -87,6 +99,7 @@ class CertCheckThread(threading.Thread):
         self._auth_error_event = auth_error_event
         self._clock = clock
         self._check_fn = check_fn
+        self._discovery_check_fn = discovery_check_fn
         self._submit_fn = submit_fn
 
     def run(self) -> None:
@@ -116,6 +129,7 @@ class CertCheckThread(threading.Thread):
                         clock=self._clock,
                         shutdown_event=self._shutdown_event,
                         check_fn=self._check_fn,
+                        discovery_check_fn=self._discovery_check_fn,
                         submit_fn=self._submit_fn,
                     )
                     # Stats update + is_first_cycle flip are part of the
@@ -201,15 +215,18 @@ def _run_one_cycle(
     shutdown_event: threading.Event,
     netbox_hosts: Optional[list[DiscoveredHost]] = None,
     check_fn: Callable = default_cert_check,
+    discovery_check_fn: Callable = default_discovery_check,
     submit_fn: Callable = default_submit,
 ) -> CycleResult:
     """One cycle: merge manual + netbox hosts → run checks in parallel
     → build payloads → submit batched /reports.
 
-    NetBox-discovered hosts are checked through the SAME cert-check
-    pipeline as manual hosts — only the host_ref shape in the report
-    differs (`type: "manual"` vs `type: "netbox"`). Phase 6 added
-    NetBox sync without wiring it into the cycle; this is the wire.
+    Cutover (Phase 9c): manual hosts and netbox hosts go through
+    different cert-check functions. Manual hosts use the original
+    `cert_check` (verify against the FQDN the operator typed). NetBox
+    hosts use `cert_check_with_discovery` (connect by IP, learn the
+    cert-presented hostname, verify against THAT). The host_ref in
+    the report distinguishes the source for the dashboard.
 
     Empty hosts (manual_hosts=[] AND netbox_hosts=[]) is a legitimate
     state. A report still goes out with checks=[]; the dashboard
@@ -225,25 +242,35 @@ def _run_one_cycle(
     netbox_hosts = list(netbox_hosts or [])
 
     # Build a unified to-check list. Manual hosts come first (preserving
-    # config order), netbox hosts second. The cycle's parallel runner
-    # treats each entry uniformly via the synthetic identity_key.
+    # config order), netbox hosts second. Each entry carries `source`
+    # so _run_parallel_checks dispatches the right cert-check function
+    # and the payload-builder dispatch picks the right serializer.
     to_check: list[dict] = []
     for h in manual_hosts:
         host_id = h.get("host_id")
         to_check.append({
             "identity_key": f"manual:{host_id}",
             "host_ref": {"type": "manual", "host_id": host_id},
-            "hostname": h.get("hostname", ""),
+            "source": "manual",
+            "connect_target": h.get("hostname", ""),
             "port": int(h.get("port", 443)),
         })
     for nh in netbox_hosts:
+        # Connect by IP when NetBox knows it; fall back to hostname
+        # (device.name FQDN) only when ip_address is missing — the
+        # cert_check_with_discovery function accepts either string,
+        # but IP-first matches Phase 9's design (the cert tells us
+        # the truth about the hostname, not the operator-supplied
+        # name).
+        connect_target = nh.ip_address or nh.hostname
         to_check.append({
             "identity_key": f"netbox:{nh.netbox_device_id}",
             "host_ref": {
                 "type": "netbox",
                 "netbox_device_id": nh.netbox_device_id,
             },
-            "hostname": nh.hostname,
+            "source": "netbox",
+            "connect_target": connect_target,
             "port": nh.port,
         })
 
@@ -257,16 +284,24 @@ def _run_one_cycle(
         }
     )
 
+    # max(alert_thresholds_days) so the cert_expiring_soon status fires
+    # at the most permissive threshold; finer-grained thresholding is
+    # done downstream by the dashboard.
+    alert_thresholds = config.get("alert_thresholds_days", [30]) or [30]
+    expiring_soon_threshold = max(int(t) for t in alert_thresholds)
+
     if to_check:
         results_by_key = _run_parallel_checks(
             hosts=to_check,
             check_fn=check_fn,
+            discovery_check_fn=discovery_check_fn,
             tcp_connect_seconds=float(
                 config.get("timeouts", {}).get("tcp_connect_seconds", 5)
             ),
             tls_handshake_seconds=float(
                 config.get("timeouts", {}).get("tls_handshake_seconds", 5)
             ),
+            expiring_soon_threshold_days=expiring_soon_threshold,
             max_concurrency=int(
                 config.get("concurrency", {}).get("max_parallel_checks", 20)
             ),
@@ -280,12 +315,7 @@ def _run_one_cycle(
                 # Skipped due to shutdown signaled before this host's
                 # worker started. Don't include in the report.
                 continue
-            checks.append(
-                build_check_payload(
-                    host_ref=entry["host_ref"],
-                    result=results_by_key[key],
-                )
-            )
+            checks.append(_build_payload_for_entry(entry, results_by_key[key]))
     else:
         checks = []
 
@@ -338,52 +368,88 @@ def _run_one_cycle(
     )
 
 
+def _build_payload_for_entry(
+    entry: dict, result: Union[CertResult, CertCheckResult],
+) -> dict:
+    """Per-source payload-builder dispatch. Manual entries always
+    produce a CertResult (old check_fn) → old builder. NetBox entries
+    always produce a CertCheckResult (new discovery_check_fn) → new
+    compat-envelope builder."""
+    if entry["source"] == "netbox":
+        return build_check_payload_from_discovery(
+            host_ref=entry["host_ref"], result=result,
+        )
+    return build_check_payload(
+        host_ref=entry["host_ref"], result=result,
+    )
+
+
 def _run_parallel_checks(
     *,
     hosts: list[dict],
     check_fn: Callable,
+    discovery_check_fn: Callable,
     tcp_connect_seconds: float,
     tls_handshake_seconds: float,
+    expiring_soon_threshold_days: int,
     max_concurrency: int,
     shutdown_event: threading.Event,
-) -> dict[str, CertResult]:
-    """Run cert_check in parallel across `hosts`. Returns a
-    {identity_key: CertResult} dict, omitting hosts skipped due to
-    shutdown.
+) -> dict[str, Union[CertResult, CertCheckResult]]:
+    """Run a cert-check function (per-entry dispatched on `source`)
+    in parallel across `hosts`. Returns a {identity_key: result} dict,
+    omitting hosts skipped due to shutdown.
 
-    Each entry in `hosts` is a dict with at least:
+    Each entry in `hosts` is a dict with:
       - identity_key: unique key per host across both sources (e.g.
         "manual:<uuid>" or "netbox:<int>"). Used as the result-dict key
         so the caller can match back to the input entry regardless of
         host source.
-      - host_ref: the report's host_ref dict (unused here; passed
-        through for log context).
-      - hostname, port: what cert_check connects to.
+      - host_ref: the report's host_ref dict (used here only for log
+        context on errors).
+      - source: "manual" or "netbox" — selects which check function
+        to invoke.
+      - connect_target: the string passed to the chosen check function
+        as its first positional arg. For manual hosts this is the
+        operator-supplied FQDN (cert_check verifies against it). For
+        netbox hosts this is ip_address (or hostname fallback) — the
+        cert-discovery function learns the canonical hostname from
+        the cert itself.
+      - port: TCP port.
 
     Mirrors Phase 3's run_cycle skip-at-pickup pattern: a worker
-    short-circuits without calling cert_check if shutdown is set when
-    the worker picks up the task. In-flight cert_check calls run to
-    completion (no interruption mid-handshake).
+    short-circuits without calling the check if shutdown is set when
+    the worker picks up the task. In-flight checks run to completion
+    (no interruption mid-handshake).
     """
-    results: dict[str, CertResult] = {}
+    results: dict[str, Union[CertResult, CertCheckResult]] = {}
 
-    def task(entry: dict) -> Optional[tuple[str, CertResult]]:
+    def task(entry: dict):
         identity_key = entry["identity_key"]
         if shutdown_event.is_set():
             return None
+        target = entry.get("connect_target", "")
+        port = int(entry.get("port", 443))
         try:
-            result = check_fn(
-                entry.get("hostname", ""),
-                int(entry.get("port", 443)),
-                connect_timeout=tcp_connect_seconds,
-                handshake_timeout=tls_handshake_seconds,
-            )
+            if entry["source"] == "netbox":
+                result = discovery_check_fn(
+                    target, port,
+                    connect_timeout=tcp_connect_seconds,
+                    handshake_timeout=tls_handshake_seconds,
+                    expiring_soon_threshold_days=expiring_soon_threshold_days,
+                )
+            else:
+                result = check_fn(
+                    target, port,
+                    connect_timeout=tcp_connect_seconds,
+                    handshake_timeout=tls_handshake_seconds,
+                )
         except Exception as e:
             log.error(
                 {
                     "event": "cert_check_unhandled_error",
                     "host_ref": entry.get("host_ref"),
-                    "hostname": entry.get("hostname"),
+                    "source": entry.get("source"),
+                    "connect_target": target,
                     "error_class": type(e).__name__,
                     "error_message": str(e),
                 }

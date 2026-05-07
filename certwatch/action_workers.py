@@ -33,8 +33,12 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from certwatch.cert_check import CertResult, cert_check as default_cert_check
+from certwatch.cert_check_with_discovery import (
+    cert_check_with_discovery as default_discovery_check,
+)
 from certwatch.check_payload import (
     build_check_payload as _build_check_payload,
+    build_check_payload_from_discovery as _build_check_payload_from_discovery,
     cert_dict_from_result as _cert_dict_from_result,
 )
 from certwatch.clock import Clock, utc_now_iso
@@ -277,6 +281,7 @@ def make_check_host_handler(
     clock: Clock,
     shutdown_event: threading.Event,
     check_fn: Callable = default_cert_check,
+    discovery_check_fn: Callable = default_discovery_check,
     submit_fn: Callable = default_submit,
     netbox_hosts_state=None,  # Optional[NetBoxHostsState]
 ) -> ActionHandler:
@@ -285,16 +290,20 @@ def make_check_host_handler(
     The factory takes everything the handler needs; the resulting closure
     has the right shape for ActionWorkerPool's handlers map.
 
-    `check_fn` and `submit_fn` are injectable for unit testing — same
-    pattern Phase 3's check_loop established. Production code uses the
-    defaults.
+    `check_fn`, `discovery_check_fn`, and `submit_fn` are injectable for
+    unit testing — same pattern Phase 3's check_loop established.
+    Production code uses the defaults.
 
     `netbox_hosts_state` is the agent's local view of NetBox-discovered
     hosts (written by NetBoxSyncThread, read here for on-demand
     cert-check resolution). When None, "netbox" host_refs can't be
     resolved — the handler logs and skips. When set, the handler looks
-    up the matching netbox_device_id in the snapshot and runs the same
-    cert-check pipeline as for manual hosts.
+    up the matching netbox_device_id in the snapshot and runs through
+    the cert-discovery pipeline (same dispatch the cycle thread uses).
+
+    Phase 9c dispatch: manual host_refs use `check_fn` (verify against
+    the FQDN the operator typed). NetBox host_refs use
+    `discovery_check_fn` (connect by IP, learn the cert's hostname).
     """
 
     def handle(ctx: ActionContext) -> None:
@@ -317,7 +326,7 @@ def make_check_host_handler(
                     }
                 )
                 return
-            hostname, port = resolved
+            connect_target, port = resolved
         elif ref_type == "netbox":
             netbox_id = host_ref.get("netbox_device_id")
             netbox_hosts = (
@@ -339,7 +348,9 @@ def make_check_host_handler(
                     }
                 )
                 return
-            hostname = matching.hostname
+            # Same connect-target rule as the cycle thread: prefer IP,
+            # fall back to FQDN when NetBox doesn't have one.
+            connect_target = matching.ip_address or matching.hostname
             port = matching.port
         else:
             log.warning(
@@ -351,19 +362,34 @@ def make_check_host_handler(
             )
             return
 
-        # Capture started_at BEFORE cert_check; completed_at AFTER. The
-        # ordering is intentional and tested explicitly.
+        # Capture started_at BEFORE the cert check; completed_at AFTER.
+        # The ordering is intentional and tested explicitly.
         started_at = utc_now_iso()
         timeouts = config.get("timeouts", {}) or {}
-        result = check_fn(
-            hostname,
-            port,
-            connect_timeout=float(timeouts.get("tcp_connect_seconds", 5)),
-            handshake_timeout=float(timeouts.get("tls_handshake_seconds", 5)),
-        )
+        connect_timeout = float(timeouts.get("tcp_connect_seconds", 5))
+        handshake_timeout = float(timeouts.get("tls_handshake_seconds", 5))
+
+        if ref_type == "netbox":
+            alert_thresholds = config.get("alert_thresholds_days", [30]) or [30]
+            result = discovery_check_fn(
+                connect_target, port,
+                connect_timeout=connect_timeout,
+                handshake_timeout=handshake_timeout,
+                expiring_soon_threshold_days=max(int(t) for t in alert_thresholds),
+            )
+            check_payload = _build_check_payload_from_discovery(
+                host_ref, result,
+            )
+        else:
+            result = check_fn(
+                connect_target, port,
+                connect_timeout=connect_timeout,
+                handshake_timeout=handshake_timeout,
+            )
+            check_payload = _build_check_payload(host_ref, result)
+
         completed_at = utc_now_iso()
 
-        check_payload = _build_check_payload(host_ref, result)
         report_id = str(uuid.uuid4())  # fresh; NOT the action_id
         submit_fn(
             client=client,

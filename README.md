@@ -103,6 +103,40 @@ cert and a cert signed by an internal CA both produce status `tls_warning`
 with `chain_trusted_by_system: false`; the `is_self_signed` boolean
 distinguishes them for UI rendering.
 
+### Wire compatibility (NetBox-discovered hosts)
+
+NetBox-discovered hosts report through the cert-discovery pipeline and
+emit a compat envelope so the existing dashboard validator keeps
+accepting reports:
+
+- `status` (top-level): legacy 3-value enum — one of `success`,
+  `tls_failed`, `connection_failed`. Old dashboards render this.
+- `status_detail` (top-level, NetBox checks only): the precise 9-value
+  enum from the table above. New dashboards prefer this field.
+- `cert.chain_trust_reason`: short enum string (`self_signed`,
+  `unknown_issuer`, `weak_md_in_chain`, …) — new field.
+- `cert.chain_error_reason`: aliased to `chain_trust_reason` for
+  backward compat with old dashboards that render a reason string.
+
+The `status` mapping is: `success` / `cert_expiring_soon` /
+`tls_warning` → `success`; `cert_expired` / `cert_no_usable_hostname` /
+`tls_failed_no_cert` / `tls_failed_malformed_cert` → `tls_failed`;
+`connection_refused` / `connection_timeout` → `connection_failed`.
+
+**`cert.ca_category` caveat**: on the deprecated old field, expired-
+but-public certs may briefly mis-categorize as `unknown` instead of
+`well_known_public` (the cert-discovery pipeline's `chain_trusted_by_system`
+proxy doesn't perfectly reproduce the original Phase 2 inputs). The
+authoritative reading is on `status_detail`; once dashboard renderers
+migrate to it, the deprecated field can be removed.
+
+Manual hosts (operator-typed FQDNs) continue to report through the
+original cert-check path with the legacy schema — no `status_detail`,
+no `chain_trust_reason`. The two paths coexist intentionally: manual
+hosts verify against the operator-supplied name (intent matters);
+NetBox hosts verify against whatever name the cert presents
+(authoritative truth from the wire).
+
 ## Logs
 
 Structured JSON, one event per line, on stdout:

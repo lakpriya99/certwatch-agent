@@ -18,6 +18,7 @@ import pytest
 import responses
 
 from certwatch.cert_check import CertResult
+from certwatch.cert_check_with_discovery import CertCheckResult
 from certwatch.clock import FakeClock
 from certwatch.dashboard_client import DashboardClient
 from certwatch.heartbeat_thread import ConfigState
@@ -114,6 +115,24 @@ def _success_cert_result(hostname: str, port: int = 443) -> CertResult:
         chain_trusted_by_system=True,
         chain_error_reason=None,
         error_message=None,
+    )
+
+
+def _success_discovery_result(target: str, port: int = 443) -> CertCheckResult:
+    """Discovery-builder counterpart to `_success_cert_result`. Used by
+    netbox-path action-handler tests after Phase 9c's per-source dispatch."""
+    return CertCheckResult(
+        status="success", ip_address=target, port=port,
+        checked_at="2026-05-02T15:00:03Z",
+        canonical_hostname=target,
+        subject_cn=target, subject_sans=[target],
+        issuer_cn="DigiCert", issuer_o="DigiCert Inc",
+        issuer_full_dn="CN=DigiCert,O=DigiCert Inc",
+        is_self_signed=False,
+        not_before="2025-01-01T00:00:00Z", not_after="2026-12-31T23:59:59Z",
+        days_until_expiry=240, signature_algorithm="SHA256withRSA",
+        key_size=2048, hostname_matches=True,
+        chain_trusted_by_system=True, chain_trust_reason=None,
     )
 
 
@@ -547,19 +566,28 @@ def test_check_host_skips_when_host_id_not_in_config(client, caplog):
 
 
 def test_check_host_netbox_ref_resolves_via_netbox_hosts_state(client):
-    """The netbox host_ref now goes through the same cert-check pipeline
-    as manual hosts. The handler resolves netbox_device_id to (hostname,
-    port) via NetBoxHostsState, then calls check_fn + submit_fn just
-    like the manual path."""
+    """The netbox host_ref goes through the cert-discovery pipeline
+    (Phase 9c). The handler resolves netbox_device_id to a connect
+    target (ip_address fallback to hostname) via NetBoxHostsState,
+    calls discovery_check_fn, and submits using the compat-envelope
+    payload builder.
+
+    Manual cert_check (`check_fn`) MUST NOT be called for a netbox
+    host_ref — this regression-tests the per-source dispatch."""
     from certwatch.netbox_client import DiscoveredHost
     from certwatch.netbox_sync import NetBoxHostsState
 
     captured = {}
+    manual_check_calls = []
 
     def fake_check(host, port, **k):
-        captured["host"] = host
-        captured["port"] = port
+        manual_check_calls.append((host, port))
         return _success_cert_result(host, port)
+
+    def fake_discovery_check(target, port, **k):
+        captured["target"] = target
+        captured["port"] = port
+        return _success_discovery_result(target, port)
 
     def fake_submit(*, checks, action_id, **k):
         captured["checks"] = checks
@@ -573,6 +601,7 @@ def test_check_host_netbox_ref_resolves_via_netbox_hosts_state(client):
             port=443,
             display_name="esxi02",
             tags=["vmware"],
+            ip_address="10.0.5.42",
         ),
     ])
 
@@ -580,7 +609,8 @@ def test_check_host_netbox_ref_resolves_via_netbox_hosts_state(client):
         client=client, data_dir="/tmp",
         config_state=ConfigState(initial=dict(INITIAL_CONFIG)),
         clock=FakeClock(), shutdown_event=threading.Event(),
-        check_fn=fake_check, submit_fn=fake_submit,
+        check_fn=fake_check, discovery_check_fn=fake_discovery_check,
+        submit_fn=fake_submit,
         netbox_hosts_state=netbox_state,
     )
     ctx = ActionContext(
@@ -590,15 +620,61 @@ def test_check_host_netbox_ref_resolves_via_netbox_hosts_state(client):
     )
     handler(ctx)
 
-    # cert_check called with NetBox-derived hostname/port
-    assert captured["host"] == "esxi02.collabtips.net"
+    # discovery_check_fn called with the IP address (preferred over
+    # hostname when ip_address is set on the DiscoveredHost).
+    assert captured["target"] == "10.0.5.42"
     assert captured["port"] == 443
+    # Old cert_check was NOT called — netbox path bypasses it.
+    assert manual_check_calls == []
     # Report submitted with the netbox host_ref echoed and action_id set
     assert captured["action_id"] == "act-uuid-1"
     assert len(captured["checks"]) == 1
     assert captured["checks"][0]["host_ref"] == {
         "type": "netbox", "netbox_device_id": 1247,
     }
+    # Compat envelope: status_detail is present on netbox-path checks.
+    assert "status_detail" in captured["checks"][0]
+
+
+def test_check_host_netbox_ref_falls_back_to_hostname_when_no_ip(client):
+    """If a NetBox device has no primary_ip set (ip_address is None),
+    the connect target falls back to the device.name FQDN. Production
+    NetBoxes often have this gap for newly-added devices."""
+    from certwatch.netbox_client import DiscoveredHost
+    from certwatch.netbox_sync import NetBoxHostsState
+
+    captured = {}
+
+    def fake_discovery_check(target, port, **k):
+        captured["target"] = target
+        return _success_discovery_result(target, port)
+
+    netbox_state = NetBoxHostsState()
+    netbox_state.replace([
+        DiscoveredHost(
+            netbox_device_id=2001,
+            hostname="newly-added.lab.local",
+            port=443, display_name="x", tags=[],
+            ip_address=None,
+        ),
+    ])
+
+    handler = make_check_host_handler(
+        client=client, data_dir="/tmp",
+        config_state=ConfigState(initial=dict(INITIAL_CONFIG)),
+        clock=FakeClock(), shutdown_event=threading.Event(),
+        discovery_check_fn=fake_discovery_check,
+        submit_fn=lambda **k: None,
+        netbox_hosts_state=netbox_state,
+    )
+    ctx = ActionContext(
+        action_id="a1", action_type="check_host",
+        payload={"host_ref": {"type": "netbox", "netbox_device_id": 2001}},
+        queued_at="t0", expires_at="2099-01-01T00:00:00Z",
+    )
+    handler(ctx)
+
+    assert captured["target"] == "newly-added.lab.local"
 
 
 def test_check_host_netbox_ref_skips_when_id_not_found(client, caplog):
