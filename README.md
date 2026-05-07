@@ -206,6 +206,24 @@ everything in `tests/e2e/` — those tests spawn the actual
 `python -m certwatch agent` subprocess against a Flask-backed mock
 dashboard and mock NetBox.
 
+### Testing NetBox integration changes
+
+The mock NetBox in `tests/e2e/mock_netbox.py` reproduces the API
+surface (`GET /api/dcim/devices/`) but does not reproduce TLS
+hostname-matching behavior on the targets the agent actually
+cert-checks. Three production bugs in the NetBox path so far —
+action-handler gap, cycle-iteration gap, and host-value-uses-IP TLS
+mismatch — could not be reproduced by the mock harness alone because
+the mock targets (`localhost`, `127.0.0.1`) don't have certs whose
+CN/SAN fields are tested against the agent's chosen hostname string.
+
+When changing how NetBox host fields flow through the cert-check
+pipeline (especially anything that touches `_resolve_hostname`,
+`_host_to_payload`, or the cycle's host-iteration order), verify
+against a real NetBox with real-FQDN devices on a deployment host
+before merging. The unit tests cover the field-extraction logic;
+real-cert verification is a separate integration concern.
+
 ## Security notes
 
 - `agent_secret` lives in `/data/agent.json` with mode `0600`. The

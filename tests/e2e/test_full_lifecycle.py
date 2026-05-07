@@ -556,8 +556,8 @@ def test_scenario_11_netbox_hosts_are_cert_checked_in_periodic_cycle(
     # quickly with status=connection_failed (we're testing the wire
     # flow, not the success path).
     mock_netbox.add_device(
-        netbox_device_id=1247, name="esxi02.lab",
-        primary_ip4="127.0.0.1/32",  # local + closed port via custom_field
+        netbox_device_id=1247, name="localhost",  # resolves to 127.0.0.1
+        primary_ip4="127.0.0.1/32",
         custom_fields={"cert_check_port": 9},  # discard port — closed
         tags=["monitor-cert"],
     )

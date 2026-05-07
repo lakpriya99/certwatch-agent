@@ -75,10 +75,21 @@ def _parse_netbox_verify_ssl_env(env: Optional[Mapping[str, str]] = None) -> boo
 @dataclass(frozen=True)
 class DiscoveredHost:
     netbox_device_id: int
+    # `hostname` is always device.name from NetBox — used for the
+    # cert check (connection target AND TLS hostname verification).
+    # Cert verification compares this string against the cert's
+    # CN/SAN, so it MUST be the FQDN-as-NetBox-knows-it. Using the
+    # primary_ip here causes hostname-mismatch tls_failed errors
+    # against certs issued by FQDN.
     hostname: str
     port: int
     display_name: Optional[str]
     tags: list[str] = field(default_factory=list)
+    # `ip_address` is the device's primary_ip4/6 (CIDR-stripped),
+    # extracted separately from hostname for dashboard display
+    # purposes. NEVER used by cert_check — that always uses hostname.
+    # None when the device has no primary_ip set.
+    ip_address: Optional[str] = None
 
 
 class NetBoxSyncError(Exception):
@@ -229,7 +240,9 @@ def _parse_filter_expr(expr: str) -> dict:
 
 def _device_to_discovered_host(d) -> Optional[DiscoveredHost]:
     """Map a pynetbox Device record to DiscoveredHost. Return None if
-    the device can't be resolved to a hostname."""
+    the device has no resolvable name (which is required for cert
+    verification — primary_ip is informational only).
+    """
     device_id = _safe_int(getattr(d, "id", None))
     if device_id is None:
         log.info(
@@ -242,29 +255,54 @@ def _device_to_discovered_host(d) -> Optional[DiscoveredHost]:
 
     hostname = _resolve_hostname(d)
     if not hostname:
+        # device.name is required because cert verification compares
+        # against the same string used for connection. Without a name,
+        # we can't safely cert-check this device — log loud + skip
+        # so the operator goes back to NetBox and sets the name.
         log.info(
             {
-                "event": "netbox_device_skipped_no_hostname",
+                "event": "netbox_device_skipped_no_name",
                 "device_id": device_id,
-                "device_name": getattr(d, "name", None),
+                "note": (
+                    "device.name is required: it's both the connection "
+                    "target and the TLS hostname-verification target. "
+                    "Set the name in NetBox (FQDN preferred so DNS and "
+                    "cert verification both succeed)."
+                ),
             }
         )
         return None
 
-    port = _resolve_port(d, device_id)
-    display = _resolve_display_name(d)
-    tags = _resolve_tags(d)
-
     return DiscoveredHost(
         netbox_device_id=device_id,
         hostname=hostname,
-        port=port,
-        display_name=display,
-        tags=tags,
+        port=_resolve_port(d, device_id),
+        display_name=_resolve_display_name(d),
+        tags=_resolve_tags(d),
+        ip_address=_resolve_ip_address(d),
     )
 
 
 def _resolve_hostname(d) -> Optional[str]:
+    """Return device.name. Used for connection AND TLS hostname
+    verification — must match the cert's CN/SAN, which is why
+    primary_ip is NOT consulted here (cert_check sees one string,
+    uses it for both purposes).
+
+    Short names (no dots) are returned as-is; if DNS can't resolve
+    them at connect time, cert_check returns connection_failed —
+    operators see an honest error rather than a TLS hostname
+    mismatch they can't easily diagnose."""
+    name = getattr(d, "name", None)
+    if name and isinstance(name, str) and name.strip():
+        return name.strip()
+    return None
+
+
+def _resolve_ip_address(d) -> Optional[str]:
+    """Extract primary_ip4/6 (CIDR stripped) for dashboard display.
+    NEVER used for cert checking — that uses _resolve_hostname so
+    TLS hostname verification works correctly."""
     for attr in ("primary_ip4", "primary_ip6"):
         ip_obj = getattr(d, attr, None)
         if ip_obj is None:
@@ -272,12 +310,7 @@ def _resolve_hostname(d) -> Optional[str]:
         addr = getattr(ip_obj, "address", None)
         if not addr:
             continue
-        # Strip CIDR notation: "10.1.2.3/24" → "10.1.2.3"
         return str(addr).split("/", 1)[0].strip()
-
-    name = getattr(d, "name", None)
-    if name and isinstance(name, str) and name.strip():
-        return name.strip()
     return None
 
 

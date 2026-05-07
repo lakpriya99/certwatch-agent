@@ -268,10 +268,16 @@ def _backoff_delay(attempts: int) -> float:
 
 def _host_to_payload(host: DiscoveredHost) -> dict:
     """Map DiscoveredHost → /discovered-hosts payload entry. Optional
-    fields (display_name, tags) are OMITTED when their natural empty
-    value applies — matches Phase 4e's contract for optional fields
-    that mean "use dashboard default" when absent. Tags=[] IS included
-    as an empty list since the contract allows that distinction."""
+    fields (display_name, tags, ip_address) are OMITTED when absent —
+    matches Phase 4e's contract for optional fields. Tags=[] IS
+    included as an empty list since the contract allows that
+    distinction.
+
+    `hostname` is always device.name (used for cert verification);
+    `ip_address` is the primary IP carried alongside for dashboard
+    display purposes. The dashboard renders both — title typically
+    shows the IP, subtitle shows the FQDN, and tolerant readers
+    that don't yet know about ip_address simply ignore it."""
     out: dict = {
         "netbox_device_id": host.netbox_device_id,
         "hostname": host.hostname,
@@ -279,6 +285,8 @@ def _host_to_payload(host: DiscoveredHost) -> dict:
     }
     if host.display_name is not None:
         out["display_name"] = host.display_name
+    if host.ip_address is not None:
+        out["ip_address"] = host.ip_address
     # tags=[] is meaningful per the 4e contract (operator removed all tags
     # vs operator never set any). Always include — keeps the wire shape
     # consistent and the dashboard can treat both equivalently if it

@@ -408,6 +408,8 @@ def test_host_to_payload_includes_required_fields():
     assert p["tags"] == []
     # display_name omitted when None (optional field)
     assert "display_name" not in p
+    # ip_address omitted when None (no primary_ip on the device)
+    assert "ip_address" not in p
 
 
 def test_host_to_payload_includes_display_name_when_set():
@@ -417,6 +419,20 @@ def test_host_to_payload_includes_display_name_when_set():
     )
     p = _host_to_payload(h)
     assert p["display_name"] == "App 01"
+
+
+def test_host_to_payload_includes_ip_address_when_set():
+    """ip_address rides alongside hostname so the dashboard can render
+    both — title typically shows IP, subtitle shows FQDN. Tolerant
+    readers that don't yet know about ip_address simply ignore it."""
+    h = DiscoveredHost(
+        netbox_device_id=1247, hostname="esxi02.collabtips.net",
+        port=443, display_name="esxi02", tags=["vmware"],
+        ip_address="10.10.2.22",
+    )
+    p = _host_to_payload(h)
+    assert p["hostname"] == "esxi02.collabtips.net"
+    assert p["ip_address"] == "10.10.2.22"
 
 
 # ============================================================

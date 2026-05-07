@@ -101,17 +101,19 @@ def _patch_api(monkeypatch, devices=None, *, raise_exc=None, capture_filter=None
 
 
 def test_fetch_hosts_with_full_data(monkeypatch):
+    """Hostname is always device.name (FQDN preferred). Primary IP gets
+    extracted to ip_address separately for dashboard display."""
     devices = [
         _device(
             id=1247,
-            name="app01",
+            name="app01.lab.example.com",
             primary_ip4=FakeIP("10.1.2.3/24"),
             custom_fields={"cert_check_port": 443},
             tags=[FakeTag("monitor-cert"), FakeTag("production")],
         ),
         _device(
             id=1248,
-            name="app02",
+            name="app02.lab.example.com",
             primary_ip4=FakeIP("192.168.1.50/24"),
             custom_fields={"cert_check_port": 8443},
             tags=[FakeTag("monitor-cert")],
@@ -124,54 +126,88 @@ def test_fetch_hosts_with_full_data(monkeypatch):
 
     assert len(hosts) == 2
     assert hosts[0] == DiscoveredHost(
-        netbox_device_id=1247, hostname="10.1.2.3", port=443,
-        display_name="app01", tags=["monitor-cert", "production"],
+        netbox_device_id=1247,
+        hostname="app01.lab.example.com",
+        port=443,
+        display_name="app01.lab.example.com",
+        tags=["monitor-cert", "production"],
+        ip_address="10.1.2.3",
     )
+    assert hosts[1].hostname == "app02.lab.example.com"
     assert hosts[1].port == 8443
-    assert hosts[1].hostname == "192.168.1.50"
+    assert hosts[1].ip_address == "192.168.1.50"
 
 
-def test_primary_ip4_strips_cidr_notation(monkeypatch):
-    _patch_api(monkeypatch, [_device(id=1, name="x", primary_ip4=FakeIP("10.1.2.3/24"))])
+def test_ip_address_extracted_from_primary_ip4_with_cidr_stripped(monkeypatch):
+    _patch_api(monkeypatch, [_device(id=1, name="x.lab", primary_ip4=FakeIP("10.1.2.3/24"))])
     [host] = NetBoxClient(url="u", token="t", filter_expr="").fetch_hosts()
-    assert host.hostname == "10.1.2.3"
+    # hostname uses device.name (used for cert verify); ip_address
+    # carries the IP separately for dashboard display.
+    assert host.hostname == "x.lab"
+    assert host.ip_address == "10.1.2.3"
 
 
-def test_primary_ip4_without_cidr_works(monkeypatch):
-    _patch_api(monkeypatch, [_device(id=1, name="x", primary_ip4=FakeIP("10.1.2.3"))])
+def test_ip_address_without_cidr_works(monkeypatch):
+    _patch_api(monkeypatch, [_device(id=1, name="x.lab", primary_ip4=FakeIP("10.1.2.3"))])
     [host] = NetBoxClient(url="u", token="t", filter_expr="").fetch_hosts()
-    assert host.hostname == "10.1.2.3"
+    assert host.ip_address == "10.1.2.3"
 
 
-def test_primary_ip6_used_when_no_ip4(monkeypatch):
+def test_ip_address_falls_back_to_ip6_when_no_ip4(monkeypatch):
+    """ip_address falls back to primary_ip6 (cidr-stripped) when ip4
+    is missing — but hostname stays at device.name in either case."""
     _patch_api(monkeypatch, [
-        _device(id=1, name="x", primary_ip4=None,
+        _device(id=1, name="x.lab", primary_ip4=None,
                 primary_ip6=FakeIP("2001:db8::1/64")),
     ])
     [host] = NetBoxClient(url="u", token="t", filter_expr="").fetch_hosts()
-    assert host.hostname == "2001:db8::1"
+    assert host.hostname == "x.lab"
+    assert host.ip_address == "2001:db8::1"
 
 
-def test_falls_back_to_device_name_when_no_primary_ip(monkeypatch):
+def test_ip_address_is_none_when_no_primary_ip(monkeypatch):
     _patch_api(monkeypatch, [
         _device(id=1, name="app01.example.com", primary_ip4=None, primary_ip6=None),
     ])
     [host] = NetBoxClient(url="u", token="t", filter_expr="").fetch_hosts()
     assert host.hostname == "app01.example.com"
+    assert host.ip_address is None
 
 
-def test_skips_device_with_no_resolvable_hostname(monkeypatch, caplog):
+def test_hostname_uses_device_name_not_ip_even_when_both_present(monkeypatch):
+    """Regression test for the production bug where the agent used the
+    device's primary_ip as the host value, then failed TLS hostname
+    verification because the cert was issued for the FQDN.
+
+    The fix: hostname is ALWAYS device.name. cert_check uses it for
+    connection (DNS-resolves) AND TLS hostname verification — both
+    paths see the same FQDN, matching what's in the cert."""
     _patch_api(monkeypatch, [
-        _device(id=1, name=None, primary_ip4=None, primary_ip6=None),
-        _device(id=2, name="x", primary_ip4=FakeIP("10.0.0.1")),
+        _device(id=1247, name="esxi02.collabtips.net",
+                primary_ip4=FakeIP("10.10.2.22/32")),
+    ])
+    [host] = NetBoxClient(url="u", token="t", filter_expr="").fetch_hosts()
+    # The IP and FQDN both present; hostname is the FQDN.
+    assert host.hostname == "esxi02.collabtips.net"
+    assert host.ip_address == "10.10.2.22"
+
+
+def test_skips_device_with_no_name(monkeypatch, caplog):
+    """Per the new contract: device.name is required (used for cert
+    verify). Even if primary_ip is set, we skip — operator must add a
+    name in NetBox before the device can be cert-checked."""
+    _patch_api(monkeypatch, [
+        _device(id=1, name=None, primary_ip4=FakeIP("10.0.0.1")),
+        _device(id=2, name="x.lab", primary_ip4=FakeIP("10.0.0.2")),
     ])
     with caplog.at_level("INFO"):
         hosts = NetBoxClient(url="u", token="t", filter_expr="").fetch_hosts()
     assert len(hosts) == 1
     assert hosts[0].netbox_device_id == 2
     skip_logs = [r.msg for r in caplog.records
-                 if isinstance(r.msg, dict) and r.msg.get("event") == "netbox_device_skipped_no_hostname"]
+                 if isinstance(r.msg, dict) and r.msg.get("event") == "netbox_device_skipped_no_name"]
     assert len(skip_logs) == 1
+    assert skip_logs[0]["device_id"] == 1
 
 
 # ---- port resolution ------------------------------------------------
@@ -333,13 +369,17 @@ def test_filter_with_empty_expression_passes_no_filters(monkeypatch):
 # ---- helper unit tests ---------------------------------------------
 
 
-def test_resolve_hostname_prefers_ip4_over_ip6():
+def test_resolve_hostname_uses_device_name_only():
+    """Regression: hostname is ALWAYS device.name regardless of
+    primary_ip. Cert verification depends on this — the same string
+    must serve both as connection target and as TLS hostname-verify
+    target."""
     d = SimpleNamespace(
         primary_ip4=FakeIP("10.0.0.1/24"),
         primary_ip6=FakeIP("2001:db8::1"),
-        name="fallback",
+        name="esxi02.lab.example.com",
     )
-    assert _resolve_hostname(d) == "10.0.0.1"
+    assert _resolve_hostname(d) == "esxi02.lab.example.com"
 
 
 def test_resolve_hostname_returns_none_when_nothing_set():
